@@ -31,6 +31,7 @@ type Result struct {
 	Err         error
 	Duration    time.Duration
 	BodySnippet string
+	RetryAfter  time.Duration // from the Retry-After response header; 0 if absent
 }
 
 // Success reports whether the receiver acknowledged with a 2xx.
@@ -87,6 +88,7 @@ func (s *Sender) Send(ctx context.Context, r Request) Result {
 		StatusCode:  resp.StatusCode,
 		Duration:    time.Since(start),
 		BodySnippet: snippet(buf[:n]),
+		RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 	}
 }
 
@@ -112,4 +114,29 @@ func snippet(b []byte) string {
 	}
 	s := strings.ToValidUTF8(string(b), "�")
 	return strings.ReplaceAll(s, "\x00", "")
+}
+
+// maxRetryAfter keeps absurd header values from overflowing time.Duration.
+const maxRetryAfter = 30 * 24 * time.Hour
+
+// parseRetryAfter understands both forms allowed by RFC 9110: a number of
+// seconds, or an HTTP date. Anything unparseable or in the past yields 0.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		if secs >= int64(maxRetryAfter/time.Second) { // also guards the multiply below against overflow
+			return maxRetryAfter
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return min(max(t.Sub(now), 0), maxRetryAfter)
+	}
+	return 0
 }

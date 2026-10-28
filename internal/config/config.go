@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"webhookdelivery/internal/retry"
 )
 
 type Config struct {
@@ -24,6 +26,13 @@ type Config struct {
 	PollInterval      time.Duration // sleep when the queue is empty
 	DeliveryTimeout   time.Duration // total time allowed for one HTTP delivery
 	LeaseDuration     time.Duration // how long a claim is held before it can be reclaimed
+	TenantSlice       int           // max deliveries taken from one tenant per claim (fairness)
+	ReaperInterval    time.Duration // how often expired leases are reclaimed
+
+	// Retry policy.
+	MaxAttempts   int             // attempts per delivery before it goes to the DLQ
+	RetrySchedule []time.Duration // nominal wait after the 1st, 2nd, ... failed attempt
+	RetryAfterMax time.Duration   // upper bound on honoring a receiver's Retry-After
 }
 
 // Load reads configuration from the environment. defaultHTTPAddr lets each
@@ -47,6 +56,12 @@ func load(get func(string) string, defaultHTTPAddr string) (Config, error) {
 		PollInterval:      duration(get, "POLL_INTERVAL", "500ms", &errs),
 		DeliveryTimeout:   duration(get, "DELIVERY_TIMEOUT", "10s", &errs),
 		LeaseDuration:     duration(get, "LEASE_DURATION", "60s", &errs),
+		TenantSlice:       integer(get, "WORKER_TENANT_SLICE", 5, &errs),
+		ReaperInterval:    duration(get, "REAPER_INTERVAL", "10s", &errs),
+
+		MaxAttempts:   integer(get, "MAX_ATTEMPTS", 8, &errs),
+		RetryAfterMax: duration(get, "RETRY_AFTER_MAX", "6h", &errs),
+		RetrySchedule: schedule(get, "RETRY_SCHEDULE", retry.DefaultSchedule, &errs),
 	}
 	if c.LogFormat == "" {
 		c.LogFormat = "text"
@@ -67,6 +82,9 @@ func load(get func(string) string, defaultHTTPAddr string) (Config, error) {
 	if c.WorkerBatchSize < 1 || c.WorkerConcurrency < 1 {
 		errs = append(errs, errors.New("WORKER_BATCH_SIZE and WORKER_CONCURRENCY must be >= 1"))
 	}
+	if c.TenantSlice < 1 || c.MaxAttempts < 1 {
+		errs = append(errs, errors.New("WORKER_TENANT_SLICE and MAX_ATTEMPTS must be >= 1"))
+	}
 	if c.LeaseDuration <= c.DeliveryTimeout {
 		errs = append(errs, errors.New("LEASE_DURATION must be longer than DELIVERY_TIMEOUT"))
 	}
@@ -80,6 +98,24 @@ func duration(get func(string) string, key, def string, errs *[]error) time.Dura
 		*errs = append(*errs, fmt.Errorf("%s: %w", key, err))
 	}
 	return d
+}
+
+// schedule parses a comma-separated list of positive durations, e.g. "30s,5m,1h".
+func schedule(get func(string) string, key string, def []time.Duration, errs *[]error) []time.Duration {
+	v := get(key)
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	var out []time.Duration
+	for part := range strings.SplitSeq(v, ",") {
+		d, err := time.ParseDuration(strings.TrimSpace(part))
+		if err != nil || d <= 0 {
+			*errs = append(*errs, fmt.Errorf("%s: %q is not a positive duration", key, part))
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 func integer(get func(string) string, key string, def int, errs *[]error) int {

@@ -41,7 +41,7 @@ func (a *API) createEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := a.store.IngestEvent(r.Context(), tenantID(r), req.Type, req.Payload, idem)
+	res, err := a.store.IngestEvent(r.Context(), tenantID(r), req.Type, req.Payload, idem, a.opts.MaxAttempts)
 	if err != nil {
 		a.internalError(w, r, err)
 		return

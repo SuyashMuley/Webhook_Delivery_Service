@@ -41,6 +41,39 @@ components:
         last_error: { type: string, nullable: true }
         next_attempt_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+        dead_at: { type: string, format: date-time, nullable: true }
+        dead_reason: { type: string, nullable: true, enum: [max_attempts, endpoint_gone, lease_expired] }
+    Attempt:
+      type: object
+      properties:
+        attempt_no: { type: integer }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: integer, nullable: true }
+        status_code: { type: integer, nullable: true }
+        error: { type: string, nullable: true }
+        response_body_snippet: { type: string, nullable: true }
+    DeliveryDetail:
+      allOf:
+        - $ref: '#/components/schemas/Delivery'
+        - type: object
+          properties:
+            event_id: { type: string, format: uuid }
+            event_type: { type: string }
+            max_attempts: { type: integer }
+            attempts: { type: array, items: { $ref: '#/components/schemas/Attempt' } }
+    DeadDelivery:
+      type: object
+      properties:
+        delivery_id: { type: string, format: uuid }
+        event_id: { type: string, format: uuid }
+        event_type: { type: string }
+        endpoint_id: { type: string, format: uuid }
+        reason: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] }
+        attempt_count: { type: integer }
+        last_status_code: { type: integer, nullable: true }
+        last_error: { type: string, nullable: true }
+        dead_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
   responses:
     Error: { description: Error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 paths:
@@ -146,3 +179,61 @@ paths:
                 type: object
                 properties: { data: { type: array, items: { $ref: '#/components/schemas/Delivery' } } }
         '404': { $ref: '#/components/responses/Error' }
+  /v1/deliveries/{id}:
+    get:
+      summary: One delivery with its full attempt history
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/DeliveryDetail' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/deliveries/{id}/replay:
+    post:
+      summary: Replay one dead-lettered delivery
+      description: Resets the attempt budget and requeues it immediately. History is kept and the replay is audited.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '202': { description: Requeued, content: { application/json: { schema: { type: object, properties: { replayed: { type: integer } } } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The delivery is not in the DLQ, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/dlq:
+    get:
+      summary: List dead-lettered deliveries (newest first)
+      parameters:
+        - { name: endpoint_id, in: query, schema: { type: string, format: uuid } }
+        - { name: reason, in: query, schema: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] } }
+        - { name: since, in: query, schema: { type: string, format: date-time }, description: "Only entries dead-lettered at or after this time" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: after, in: query, schema: { type: string }, description: "Opaque cursor from next_after" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/DeadDelivery' } }
+                  next_after: { type: string, nullable: true }
+  /v1/dlq/replay:
+    post:
+      summary: Replay dead-lettered deliveries in bulk
+      description: |
+        Requeues up to `limit` matching deliveries. Their due times are staggered so they are sent at
+        about `rate_per_second`, so a replay does not swamp a receiver that has only just recovered.
+        Call again to continue if more remain.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                endpoint_id: { type: string, format: uuid }
+                reason: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] }
+                since: { type: string, format: date-time }
+                limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+                rate_per_second: { type: number, exclusiveMinimum: 0, maximum: 1000, default: 10 }
+      responses:
+        '202': { description: Requeued, content: { application/json: { schema: { type: object, properties: { replayed: { type: integer } } } } } }
+        '400': { $ref: '#/components/responses/Error' }

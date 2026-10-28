@@ -92,7 +92,7 @@ sequenceDiagram
     participant D as Postgres
     participant E as Customer endpoint
     loop poll
-        W->>D: claim batch (SKIP LOCKED, fair per tenant, per-endpoint cap) → in_flight + lease
+        W->>D: claim batch (SKIP LOCKED, fair per tenant, tenant in-flight cap; skips paused endpoints) → in_flight + lease
         par for each delivery (bounded concurrency)
             W->>W: check circuit breaker, build signed request
             W->>E: POST (SSRF-safe dialer, 10s timeout, no redirects)
@@ -106,9 +106,9 @@ Outcome handling after each attempt:
 
 | Result | Delivery update |
 |---|---|
-| 2xx | `succeeded`; reset endpoint failure counter |
+| 2xx | `succeeded` |
 | 410 | `dead` (`endpoint_gone`); pause endpoint |
-| Other failure, attempts left | `pending`, `next_attempt_at = now + full-jitter backoff` (or `Retry-After`) |
+| Other failure, attempts left | `pending`, `next_attempt_at = now + scheduled delay with equal jitter` (at least `Retry-After` on 429/503) |
 | Other failure, exhausted | `dead` (`max_attempts`) → DLQ |
 
 ### 5.3 State machine
@@ -129,7 +129,7 @@ stateDiagram-v2
 - **Worker crash**: lease expires; reaper returns the row to `pending`. The request may already have reached the receiver, hence *at-least-once* (receivers dedupe on `webhook-id`).
 - **Worker shutdown**: stop claiming, drain in-flight within a deadline, release remaining leases.
 - **Postgres outage**: API returns 503; workers back off; no data loss.
-- **Dead endpoint**: circuit breaker opens, deferring attempts; auto-disable after prolonged failure.
+- **Dead endpoint**: a 410 pauses the endpoint immediately. Circuit breaker and auto-disable for endpoints that merely fail arrive in Phase 3.
 
 ## 6. Isolation and Fairness
 
@@ -187,7 +187,7 @@ Local development: Docker Compose with Postgres, api, worker, a configurable fla
 |---|---|
 | No accepted event is lost | Durable commit before `202` |
 | At-least-once delivery | Duplicates possible; receivers dedupe on `webhook-id` |
-| Bounded retries, then DLQ | ~8 attempts over ~24h by default |
+| Bounded retries, then DLQ | 8 attempts over up to ~24h by default (`30s, 5m, 30m, 2h, 5h, 8h, 8h` with equal jitter) |
 | Tenant isolation | Data and capacity |
 | **Not guaranteed**: ordering | Retries reorder events; documented |
 | **Not guaranteed**: exactly-once | Impossible over HTTP |

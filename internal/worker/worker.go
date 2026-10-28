@@ -4,25 +4,30 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
 	"webhookdelivery/internal/deliver"
+	"webhookdelivery/internal/retry"
 	"webhookdelivery/internal/sign"
 	"webhookdelivery/internal/store"
 )
 
-// interimRetryDelay is a fixed placeholder until Phase 2 replaces it with
-// exponential backoff, attempt limits and the dead letter queue.
-const interimRetryDelay = 30 * time.Second
+// reclaimBatch bounds how many expired leases one reaper pass handles.
+const reclaimBatch = 500
 
 type Config struct {
-	ID           string // identifies this worker in deliveries.locked_by
-	BatchSize    int
-	Concurrency  int
-	PollInterval time.Duration
-	Lease        time.Duration
+	ID             string // identifies this worker in deliveries.locked_by
+	BatchSize      int
+	TenantSlice    int // max deliveries claimed from one tenant per poll
+	Concurrency    int
+	PollInterval   time.Duration
+	Lease          time.Duration
+	ReaperInterval time.Duration
+	Retry          retry.Policy
 }
 
 type Worker struct {
@@ -58,7 +63,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 
-		claimed, err := w.store.ClaimDeliveries(ctx, w.cfg.ID, min(w.cfg.BatchSize, free), w.cfg.Lease)
+		claimed, err := w.store.ClaimDeliveries(ctx, w.cfg.ID, min(w.cfg.BatchSize, free), w.cfg.TenantSlice, w.cfg.Lease)
 		if err != nil {
 			if ctx.Err() == nil {
 				w.log.Error("claim deliveries", "error", err)
@@ -124,17 +129,74 @@ func (w *Worker) process(d store.ClaimedDelivery) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if res.Success() {
+	var (
+		verdict string
+		delay   time.Duration
+	)
+	switch {
+	case res.Success():
+		verdict = "succeeded"
 		err = w.store.CompleteDelivery(ctx, w.cfg.ID, d, attempt)
-	} else {
-		err = w.store.FailDelivery(ctx, w.cfg.ID, d, attempt, time.Now().Add(interimRetryDelay))
+	case res.StatusCode == http.StatusGone:
+		// 410 is the receiver telling us the endpoint no longer exists: stop
+		// sending, dead-letter this delivery and pause the endpoint.
+		verdict = "dead:" + store.DeadEndpointGone
+		err = w.store.KillDelivery(ctx, w.cfg.ID, d, attempt, store.DeadEndpointGone)
+	case d.Attempt >= d.MaxAttempts:
+		verdict = "dead:" + store.DeadMaxAttempts
+		err = w.store.KillDelivery(ctx, w.cfg.ID, d, attempt, store.DeadMaxAttempts)
+	default:
+		// Retry-After only means something on 429 and 503.
+		var retryAfter time.Duration
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable {
+			retryAfter = res.RetryAfter
+		}
+		delay = w.cfg.Retry.Delay(d.Attempt, retryAfter, retry.Jitter())
+		verdict = "retry"
+		err = w.store.FailDelivery(ctx, w.cfg.ID, d, attempt, time.Now().Add(delay))
+	}
+	if errors.Is(err, store.ErrLeaseLost) {
+		// The lease expired and the delivery was reclaimed while we were sending.
+		// Whoever holds it now owns the outcome; ours must not overwrite it.
+		log.Warn("lease lost before the outcome could be recorded", "status", res.StatusCode)
+		return
 	}
 	if err != nil {
 		log.Error("record delivery outcome", "error", err)
 		return
 	}
-	log.Info("delivery attempt", "success", res.Success(), "status", res.StatusCode,
-		"duration_ms", res.Duration.Milliseconds())
+	log.Info("delivery attempt", "verdict", verdict, "status", res.StatusCode,
+		"duration_ms", res.Duration.Milliseconds(), "retry_in", delay.Round(time.Second))
+}
+
+// RunReaper periodically returns deliveries whose lease expired (their worker
+// crashed or stalled) to the queue, or to the DLQ once their attempts are used
+// up. Every worker runs one; the queries are safe to run concurrently.
+func (w *Worker) RunReaper(ctx context.Context) error {
+	t := time.NewTicker(w.cfg.ReaperInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		for ctx.Err() == nil {
+			requeued, dead, err := w.store.ReclaimExpired(ctx, reclaimBatch)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.log.Error("reclaim expired leases", "error", err)
+				}
+				break
+			}
+			if requeued+dead > 0 {
+				w.log.Warn("reclaimed expired leases", "requeued", requeued, "dead_lettered", dead)
+			}
+			if requeued+dead < reclaimBatch {
+				break
+			}
+		}
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) {

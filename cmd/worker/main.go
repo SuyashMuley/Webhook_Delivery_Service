@@ -14,6 +14,7 @@ import (
 	"webhookdelivery/internal/config"
 	"webhookdelivery/internal/deliver"
 	"webhookdelivery/internal/logging"
+	"webhookdelivery/internal/retry"
 	"webhookdelivery/internal/server"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/internal/worker"
@@ -47,11 +48,14 @@ func run() error {
 		return err
 	}
 	w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout), log, worker.Config{
-		ID:           id,
-		BatchSize:    cfg.WorkerBatchSize,
-		Concurrency:  cfg.WorkerConcurrency,
-		PollInterval: cfg.PollInterval,
-		Lease:        cfg.LeaseDuration,
+		ID:             id,
+		BatchSize:      cfg.WorkerBatchSize,
+		TenantSlice:    cfg.TenantSlice,
+		Concurrency:    cfg.WorkerConcurrency,
+		PollInterval:   cfg.PollInterval,
+		Lease:          cfg.LeaseDuration,
+		ReaperInterval: cfg.ReaperInterval,
+		Retry:          retry.Policy{Schedule: cfg.RetrySchedule, MaxRetryAfter: cfg.RetryAfterMax},
 	})
 
 	// The health server and the delivery loop live and die together: if either
@@ -64,6 +68,7 @@ func run() error {
 		log.Info("worker started", "worker_id", id)
 		return w.Run(gctx)
 	})
+	g.Go(func() error { return w.RunReaper(gctx) })
 	return g.Wait()
 }
 

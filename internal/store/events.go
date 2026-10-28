@@ -11,8 +11,9 @@ import (
 // IngestEvent stores an event and fans it out to every active endpoint of the
 // tenant subscribed to its type, all in one transaction. If idemKey is set and
 // the tenant already ingested that key, nothing is written and the original
-// event is returned with Duplicate = true.
-func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, payload json.RawMessage, idemKey string) (IngestResult, error) {
+// event is returned with Duplicate = true. Each delivery may be attempted at
+// most maxAttempts times before it is sent to the DLQ.
+func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, payload json.RawMessage, idemKey string, maxAttempts int) (IngestResult, error) {
 	var res IngestResult
 	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		var key *string
@@ -41,11 +42,11 @@ func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, pay
 		}
 
 		tag, err := tx.Exec(ctx,
-			`INSERT INTO deliveries (tenant_id, event_id, endpoint_id)
-			 SELECT $1::uuid, $2::uuid, id FROM endpoints
+			`INSERT INTO deliveries (tenant_id, event_id, endpoint_id, max_attempts)
+			 SELECT $1::uuid, $2::uuid, id, $4::int FROM endpoints
 			  WHERE tenant_id = $1::uuid AND status = 'active'
 			    AND ('*' = ANY(event_types) OR $3 = ANY(event_types))`,
-			tenantID, res.EventID, eventType)
+			tenantID, res.EventID, eventType, maxAttempts)
 		res.Deliveries = int(tag.RowsAffected())
 		return err
 	})
@@ -67,7 +68,7 @@ func (s *Store) ListEventDeliveries(ctx context.Context, tenantID, eventID strin
 
 	rows, err := s.Pool.Query(ctx,
 		`SELECT id::text, endpoint_id::text, status, attempt_count, last_status_code,
-		        last_error, next_attempt_at, created_at, dead_at
+		        last_error, next_attempt_at, created_at, dead_at, dead_reason
 		   FROM deliveries WHERE event_id = $1 AND tenant_id = $2
 		  ORDER BY created_at, id`, eventID, tenantID)
 	if err != nil {
@@ -76,7 +77,7 @@ func (s *Store) ListEventDeliveries(ctx context.Context, tenantID, eventID strin
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (DeliverySummary, error) {
 		var d DeliverySummary
 		err := r.Scan(&d.ID, &d.EndpointID, &d.Status, &d.AttemptCount, &d.LastStatusCode,
-			&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt)
+			&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt, &d.DeadReason)
 		return d, err
 	})
 }

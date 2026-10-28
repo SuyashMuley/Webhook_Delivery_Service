@@ -2,7 +2,7 @@
 
 Multi-tenant webhook delivery service with retries and a dead letter queue. See [docs/architecture.md](docs/architecture.md) for the design and [docs/plan.md](docs/plan.md) for the build plan.
 
-**Status:** Phases 0-1 complete: events fan out to subscribed endpoints and are delivered signed, once. Retries with backoff and the DLQ are Phase 2 (until then a failed delivery is retried every 30s).
+**Status:** Phases 0-2 complete: events fan out to subscribed endpoints and are delivered signed, with scheduled retries, a dead letter queue with replay, and recovery from crashed workers. Next: isolation and security hardening (Phase 3).
 
 ## Run locally
 
@@ -25,6 +25,23 @@ docker compose logs mockreceiver     # shows verified=true
 make down
 ```
 
+### Try failures, the DLQ and crash recovery
+
+The mock receiver's behavior is chosen by hook name: `/hook/fail*` returns 500, `/hook/gone*` 410, `/hook/limited*` 429 + `Retry-After`, `/hook/slow*` answers after 6s. Start the stack with a fast retry policy:
+
+```sh
+MAX_ATTEMPTS=3 RETRY_SCHEDULE=1s,2s DELIVERY_TIMEOUT=8s LEASE_DURATION=10s REAPER_INTERVAL=2s make up
+# register endpoints at http://mockreceiver:9000/hook/fail1 and /hook/slow1, publish an event, then:
+docker compose kill -s KILL worker && docker compose start worker   # crash mid-delivery; it is recovered after the lease expires
+
+curl -s localhost:8080/v1/dlq -H "Authorization: Bearer $KEY"                        # dead deliveries
+curl -s localhost:8080/v1/deliveries/$ID -H "Authorization: Bearer $KEY"             # attempt history
+curl -s -X POST localhost:8080/v1/deliveries/$ID/replay -H "Authorization: Bearer $KEY"
+curl -s localhost:8080/v1/dlq/replay -H "Authorization: Bearer $KEY" -d '{"reason":"max_attempts","rate_per_second":5}'
+```
+
+Retry settings (all optional): `MAX_ATTEMPTS` (8), `RETRY_SCHEDULE` (`30s,5m,30m,2h,5h,8h,8h`), `RETRY_AFTER_MAX` (6h), `WORKER_TENANT_SLICE` (5), `LEASE_DURATION`, `REAPER_INTERVAL`.
+
 API reference: [api/openapi.yaml](api/openapi.yaml).
 
 Without Docker for the Go services: start Postgres with `docker compose up -d postgres`, then `make migrate-up run-api`.
@@ -36,7 +53,8 @@ cmd/{api,worker,migrate}   entrypoints
 cmd/{admin,mockreceiver}   bootstrap CLI and dev webhook receiver
 api/openapi.yaml           API spec
 internal/api               /v1 handlers + API-key auth
-internal/worker            claim -> send -> record loop
+internal/worker            claim -> send -> retry/DLQ decision loop, lease reaper
+internal/retry             backoff schedule and jitter
 internal/deliver           signed HTTP sender
 internal/sign              Standard Webhooks HMAC signing
 internal/auth              API key generation/hashing

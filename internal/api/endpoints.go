@@ -50,7 +50,7 @@ func (a *API) validateURL(raw string) error {
 	if err != nil || u.Host == "" {
 		return errors.New("url must be an absolute URL")
 	}
-	if schemeOK := u.Scheme == "https" || (u.Scheme == "http" && a.allowInsecureURLs); !schemeOK {
+	if schemeOK := u.Scheme == "https" || (u.Scheme == "http" && a.opts.AllowInsecureURLs); !schemeOK {
 		return errors.New("url must use https")
 	}
 	if u.User != nil {

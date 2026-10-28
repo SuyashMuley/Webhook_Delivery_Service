@@ -20,6 +20,13 @@ services:
     environment: &env
       DATABASE_URL: postgres://webhooks:webhooks@postgres:5432/webhooks?sslmode=disable
       APP_ENV: dev
+      # Optional overrides, e.g. `RETRY_SCHEDULE=1s,2s MAX_ATTEMPTS=3 docker compose up`.
+      # Blank means "use the default".
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-}
+      RETRY_SCHEDULE: ${RETRY_SCHEDULE:-}
+      DELIVERY_TIMEOUT: ${DELIVERY_TIMEOUT:-}
+      LEASE_DURATION: ${LEASE_DURATION:-}
+      REAPER_INTERVAL: ${REAPER_INTERVAL:-}
     depends_on:
       postgres: { condition: service_healthy }
     restart: "no"

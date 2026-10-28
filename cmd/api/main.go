@@ -39,7 +39,7 @@ func run() error {
 
 	mux := server.NewMux(db)
 	// Plain-http endpoint URLs are convenient locally and forbidden in production.
-	api.New(db, log, cfg.Env != "prod").Register(mux)
+	api.New(db, log, api.Options{AllowInsecureURLs: cfg.Env != "prod", MaxAttempts: cfg.MaxAttempts}).Register(mux)
 
 	return server.Run(ctx, log, cfg.HTTPAddr, mux, cfg.ShutdownTimeout)
 }

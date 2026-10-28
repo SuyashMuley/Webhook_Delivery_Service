@@ -101,3 +101,23 @@ func TestSnippetSanitizes(t *testing.T) {
 		t.Fatalf("snippet = %q", got)
 	}
 }
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	cases := map[string]time.Duration{
+		"":                              0,
+		"30":                            30 * time.Second,
+		" 120 ":                         2 * time.Minute,
+		"0":                             0,
+		"-5":                            0,
+		"soon":                          0,
+		"Wed, 28 Oct 2026 12:05:00 GMT": 5 * time.Minute,
+		"Wed, 28 Oct 2026 11:00:00 GMT": 0, // in the past
+		"99999999999999":                maxRetryAfter,
+	}
+	for in, want := range cases {
+		if got := parseRetryAfter(in, now); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+}

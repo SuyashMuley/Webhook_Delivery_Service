@@ -14,14 +14,22 @@ import (
 	"webhookdelivery/internal/store"
 )
 
-type API struct {
-	store             *store.Store
-	log               *slog.Logger
-	allowInsecureURLs bool // permit http:// endpoint URLs (dev only)
+type Options struct {
+	AllowInsecureURLs bool // permit http:// endpoint URLs (dev only)
+	MaxAttempts       int  // attempts per delivery before it is dead-lettered
 }
 
-func New(s *store.Store, log *slog.Logger, allowInsecureURLs bool) *API {
-	return &API{store: s, log: log, allowInsecureURLs: allowInsecureURLs}
+type API struct {
+	store *store.Store
+	log   *slog.Logger
+	opts  Options
+}
+
+func New(s *store.Store, log *slog.Logger, opts Options) *API {
+	if opts.MaxAttempts < 1 {
+		opts.MaxAttempts = 8
+	}
+	return &API{store: s, log: log, opts: opts}
 }
 
 // Register mounts all /v1 routes, each behind API-key authentication.
@@ -34,6 +42,11 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	mux.Handle("POST /v1/events", a.authenticate(a.createEvent))
 	mux.Handle("GET /v1/events/{id}/deliveries", a.authenticate(a.listEventDeliveries))
+
+	mux.Handle("GET /v1/deliveries/{id}", a.authenticate(a.getDelivery))
+	mux.Handle("POST /v1/deliveries/{id}/replay", a.authenticate(a.replayDelivery))
+	mux.Handle("GET /v1/dlq", a.authenticate(a.listDLQ))
+	mux.Handle("POST /v1/dlq/replay", a.authenticate(a.replayDLQ))
 }
 
 type tenantKey struct{}

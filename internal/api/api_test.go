@@ -29,7 +29,7 @@ func newEnv(t *testing.T, allowInsecure bool) *env {
 	st := testutil.NewStore(t)
 	tenant, key := testutil.NewTenant(t, st, "acme")
 	mux := http.NewServeMux()
-	api.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)), allowInsecure).Register(mux)
+	api.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)), api.Options{AllowInsecureURLs: allowInsecure, MaxAttempts: 8}).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &env{t: t, srv: srv, st: st, tenant: tenant, key: key}
