@@ -15,7 +15,7 @@ func (f fakePinger) Ping(context.Context) error { return f.err }
 func get(t *testing.T, p Pinger, path string) int {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	NewMux(p).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	NewMux(p).ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
 	return rec.Code
 }
 
