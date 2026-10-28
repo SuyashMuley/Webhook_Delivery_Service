@@ -1,0 +1,61 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: webhooks
+          POSTGRES_PASSWORD: webhooks
+          POSTGRES_DB: webhooks
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U webhooks"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://webhooks:webhooks@localhost:5432/webhooks?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: Migrations apply and roll back cleanly
+        run: |
+          go run ./cmd/migrate up
+          go run ./cmd/migrate down
+          go run ./cmd/migrate up
+      - run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cmd: [api, worker, migrate]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg CMD=${{ matrix.cmd }} -t webhookdelivery-${{ matrix.cmd }} .
