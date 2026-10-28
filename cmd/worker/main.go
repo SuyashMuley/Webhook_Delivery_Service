@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"golang.org/x/sync/errgroup"
+
 	"webhookdelivery/internal/config"
+	"webhookdelivery/internal/deliver"
 	"webhookdelivery/internal/logging"
 	"webhookdelivery/internal/server"
 	"webhookdelivery/internal/store"
+	"webhookdelivery/internal/worker"
 )
 
 func main() {
@@ -36,8 +42,40 @@ func run() error {
 	}
 	defer db.Close()
 
-	// The claim/deliver loop arrives in Phase 1; for now the worker only
-	// exposes health endpoints so it can be deployed and probed.
-	log.Info("worker started; delivery loop not implemented yet")
-	return server.Run(ctx, log, cfg.HTTPAddr, server.NewMux(db), cfg.ShutdownTimeout)
+	id, err := workerID()
+	if err != nil {
+		return err
+	}
+	w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout), log, worker.Config{
+		ID:           id,
+		BatchSize:    cfg.WorkerBatchSize,
+		Concurrency:  cfg.WorkerConcurrency,
+		PollInterval: cfg.PollInterval,
+		Lease:        cfg.LeaseDuration,
+	})
+
+	// The health server and the delivery loop live and die together: if either
+	// stops, the other is cancelled.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return server.Run(gctx, log, cfg.HTTPAddr, server.NewMux(db), cfg.ShutdownTimeout)
+	})
+	g.Go(func() error {
+		log.Info("worker started", "worker_id", id)
+		return w.Run(gctx)
+	})
+	return g.Wait()
+}
+
+// workerID is unique per process so lease ownership is unambiguous.
+func workerID() (string, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return host + "-" + hex.EncodeToString(b), nil
 }

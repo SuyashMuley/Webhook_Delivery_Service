@@ -30,6 +30,15 @@ func TestLoadProdDefaultsToJSONLogs(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsLeaseShorterThanTimeout(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"DATABASE_URL": "postgres://x", "DELIVERY_TIMEOUT": "30s", "LEASE_DURATION": "10s",
+	}), ":8080")
+	if err == nil || !strings.Contains(err.Error(), "LEASE_DURATION") {
+		t.Fatalf("want lease error, got %v", err)
+	}
+}
+
 func TestLoadReportsAllErrors(t *testing.T) {
 	_, err := load(env(map[string]string{"APP_ENV": "staging", "SHUTDOWN_TIMEOUT": "soon"}), ":8080")
 	if err == nil {

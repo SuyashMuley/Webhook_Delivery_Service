@@ -1,0 +1,148 @@
+openapi: 3.0.3
+info:
+  title: Webhook Delivery API
+  version: 0.1.0
+  description: |
+    Register endpoints, publish events, and inspect deliveries. Delivery is at-least-once
+    and unordered; receivers should deduplicate on the `webhook-id` header (the event id).
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, description: "Tenant API key (whk_...)" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties: { code: { type: string }, message: { type: string } }
+    Endpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string }
+        description: { type: string }
+        event_types: { type: array, items: { type: string }, description: 'Event types to receive; "*" matches all.' }
+        status: { type: string, enum: [active, paused, disabled] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        secret: { type: string, description: Signing secret; returned only when the endpoint is created. }
+    Delivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        endpoint_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, in_flight, succeeded, dead] }
+        attempt_count: { type: integer }
+        last_status_code: { type: integer, nullable: true }
+        last_error: { type: string, nullable: true }
+        next_attempt_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+  responses:
+    Error: { description: Error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+paths:
+  /v1/endpoints:
+    post:
+      summary: Create an endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, description: "https URL (http allowed only in dev)" }
+                description: { type: string }
+                event_types: { type: array, items: { type: string }, default: ["*"] }
+                secret: { type: string, description: "Optional whsec_ secret (base64, 16-64 bytes); generated if omitted" }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Endpoint' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+    get:
+      summary: List endpoints (keyset pagination)
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: after, in: query, schema: { type: string, format: uuid }, description: "Endpoint id to continue after (use next_after)" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Endpoint' } }
+                  next_after: { type: string, nullable: true }
+  /v1/endpoints/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: Get an endpoint
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Endpoint' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      summary: Update an endpoint (pause/resume, change URL or subscriptions)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string }
+                description: { type: string }
+                event_types: { type: array, items: { type: string } }
+                status: { type: string, enum: [active, paused] }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Endpoint' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      summary: Delete an endpoint and its deliveries
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/events:
+    post:
+      summary: Publish an event
+      description: Fans out to every active endpoint subscribed to the type. Send `Idempotency-Key` to make retries safe.
+      parameters:
+        - { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 255 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, payload]
+              properties:
+                type: { type: string, example: invoice.paid }
+                payload: { type: object, description: "Up to 256KB" }
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { id: { type: string }, deliveries: { type: integer }, duplicate: { type: boolean } }
+        '200': { description: Duplicate Idempotency-Key; the original event is returned }
+        '413': { $ref: '#/components/responses/Error' }
+  /v1/events/{id}/deliveries:
+    get:
+      summary: Delivery status for an event
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/Delivery' } } }
+        '404': { $ref: '#/components/responses/Error' }

@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cmd: [api, worker, migrate]
+        cmd: [api, worker, migrate, admin, mockreceiver]
     steps:
       - uses: actions/checkout@v4
       - run: docker build --build-arg CMD=${{ matrix.cmd }} -t webhookdelivery-${{ matrix.cmd }} .

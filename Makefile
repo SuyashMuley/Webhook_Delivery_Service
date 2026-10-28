@@ -9,7 +9,9 @@ build:
 vet:
 	go vet ./...
 
+# Integration tests need Postgres (DATABASE_URL); start it if it isn't running.
 test:
+	docker compose up -d postgres --wait
 	go test -race ./...
 
 lint:

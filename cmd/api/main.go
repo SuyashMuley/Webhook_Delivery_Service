@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"webhookdelivery/internal/api"
 	"webhookdelivery/internal/config"
 	"webhookdelivery/internal/logging"
 	"webhookdelivery/internal/server"
@@ -36,5 +37,9 @@ func run() error {
 	}
 	defer db.Close()
 
-	return server.Run(ctx, log, cfg.HTTPAddr, server.NewMux(db), cfg.ShutdownTimeout)
+	mux := server.NewMux(db)
+	// Plain-http endpoint URLs are convenient locally and forbidden in production.
+	api.New(db, log, cfg.Env != "prod").Register(mux)
+
+	return server.Run(ctx, log, cfg.HTTPAddr, mux, cfg.ShutdownTimeout)
 }
