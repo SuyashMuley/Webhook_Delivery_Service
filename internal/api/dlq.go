@@ -22,9 +22,10 @@ const (
 )
 
 var deadReasons = map[string]bool{
-	store.DeadMaxAttempts:  true,
-	store.DeadEndpointGone: true,
-	store.DeadLeaseExpired: true,
+	store.DeadMaxAttempts:      true,
+	store.DeadEndpointGone:     true,
+	store.DeadLeaseExpired:     true,
+	store.DeadEndpointDisabled: true,
 }
 
 // parseDeadFilter reads the endpoint_id, reason and since filters shared by
@@ -39,7 +40,7 @@ func parseDeadFilter(endpointID, reason, since string) (store.DeadFilter, string
 	}
 	if reason != "" {
 		if !deadReasons[reason] {
-			return f, "reason must be one of max_attempts, endpoint_gone, lease_expired"
+			return f, "reason must be one of max_attempts, endpoint_gone, endpoint_disabled, lease_expired"
 		}
 		f.Reason = reason
 	}

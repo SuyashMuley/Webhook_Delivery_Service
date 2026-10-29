@@ -14,8 +14,10 @@ func (s *Store) ListDead(ctx context.Context, tenantID string, f DeadFilter, cur
 	if cursor != nil {
 		curAt, curID = cursor.DeadAt, cursor.ID
 	}
-	rows, err := s.Pool.Query(ctx,
-		`SELECT d.id::text, d.event_id::text, ev.type, d.endpoint_id::text, d.dead_reason,
+	var out []DeadDelivery
+	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT d.id::text, d.event_id::text, ev.type, d.endpoint_id::text, d.dead_reason,
 		        d.attempt_count, d.last_status_code, d.last_error, d.dead_at, d.created_at
 		   FROM deliveries d JOIN events ev ON ev.id = d.event_id
 		  WHERE d.tenant_id = $1 AND d.status = 'dead'
@@ -25,47 +27,53 @@ func (s *Store) ListDead(ctx context.Context, tenantID string, f DeadFilter, cur
 		    AND ($5::timestamptz IS NULL OR (d.dead_at, d.id) < ($5::timestamptz, $6::uuid))
 		  ORDER BY d.dead_at DESC, d.id DESC
 		  LIMIT $7`,
-		tenantID, nullStr(f.EndpointID), nullStr(f.Reason), f.Since, curAt, curID, limit)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (DeadDelivery, error) {
-		var d DeadDelivery
-		err := r.Scan(&d.DeliveryID, &d.EventID, &d.EventType, &d.EndpointID, &d.Reason,
-			&d.AttemptCount, &d.LastStatusCode, &d.LastError, &d.DeadAt, &d.CreatedAt)
-		return d, err
+			tenantID, nullStr(f.EndpointID), nullStr(f.Reason), f.Since, curAt, curID, limit)
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (DeadDelivery, error) {
+			var d DeadDelivery
+			err := r.Scan(&d.DeliveryID, &d.EventID, &d.EventType, &d.EndpointID, &d.Reason,
+				&d.AttemptCount, &d.LastStatusCode, &d.LastError, &d.DeadAt, &d.CreatedAt)
+			return d, err
+		})
+		return err
 	})
+	return out, err
 }
 
 // GetDelivery returns one of the tenant's deliveries with its attempt history.
 func (s *Store) GetDelivery(ctx context.Context, tenantID, id string) (DeliveryDetail, error) {
 	var d DeliveryDetail
-	err := s.Pool.QueryRow(ctx,
-		`SELECT d.id::text, d.endpoint_id::text, d.status, d.attempt_count, d.last_status_code,
-		        d.last_error, d.next_attempt_at, d.created_at, d.dead_at, d.dead_reason,
-		        d.event_id::text, ev.type, d.max_attempts
-		   FROM deliveries d JOIN events ev ON ev.id = d.event_id
-		  WHERE d.id = $1 AND d.tenant_id = $2`, id, tenantID).
-		Scan(&d.ID, &d.EndpointID, &d.Status, &d.AttemptCount, &d.LastStatusCode,
-			&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt, &d.DeadReason,
-			&d.EventID, &d.EventType, &d.MaxAttempts)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return d, ErrNotFound
-	}
-	if err != nil {
-		return d, err
-	}
+	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx,
+			`SELECT d.id::text, d.endpoint_id::text, d.status, d.attempt_count, d.last_status_code,
+			        d.last_error, d.next_attempt_at, d.created_at, d.dead_at, d.dead_reason,
+			        d.event_id::text, ev.type, d.max_attempts
+			   FROM deliveries d JOIN events ev ON ev.id = d.event_id
+			  WHERE d.id = $1 AND d.tenant_id = $2`, id, tenantID).
+			Scan(&d.ID, &d.EndpointID, &d.Status, &d.AttemptCount, &d.LastStatusCode,
+				&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt, &d.DeadReason,
+				&d.EventID, &d.EventType, &d.MaxAttempts)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
 
-	rows, err := s.Pool.Query(ctx,
-		`SELECT attempt_no, started_at, duration_ms, status_code, error, response_body_snippet
-		   FROM attempts WHERE delivery_id = $1 ORDER BY id`, id)
-	if err != nil {
-		return d, err
-	}
-	d.Attempts, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (AttemptRecord, error) {
-		var a AttemptRecord
-		err := r.Scan(&a.AttemptNo, &a.StartedAt, &a.DurationMS, &a.StatusCode, &a.Error, &a.ResponseBodySnippet)
-		return a, err
+		rows, err := tx.Query(ctx,
+			`SELECT attempt_no, started_at, duration_ms, status_code, error, response_body_snippet
+			   FROM attempts WHERE delivery_id = $1 ORDER BY id`, id)
+		if err != nil {
+			return err
+		}
+		d.Attempts, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (AttemptRecord, error) {
+			var a AttemptRecord
+			err := r.Scan(&a.AttemptNo, &a.StartedAt, &a.DurationMS, &a.StatusCode, &a.Error, &a.ResponseBodySnippet)
+			return a, err
+		})
+		return err
 	})
 	if d.Attempts == nil {
 		d.Attempts = []AttemptRecord{}
@@ -111,8 +119,10 @@ SELECT count(*) FROM replayed`
 // replay is recorded in delivery_replays. It returns how many were replayed.
 func (s *Store) ReplayDead(ctx context.Context, tenantID string, f DeadFilter, limit int, ratePerSec float64) (int, error) {
 	var n int
-	err := s.Pool.QueryRow(ctx, replaySQL, tenantID, nullStr(f.DeliveryID), nullStr(f.EndpointID),
-		nullStr(f.Reason), f.Since, limit, ratePerSec).Scan(&n)
+	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, replaySQL, tenantID, nullStr(f.DeliveryID), nullStr(f.EndpointID),
+			nullStr(f.Reason), f.Since, limit, ratePerSec).Scan(&n)
+	})
 	return n, err
 }
 
@@ -127,9 +137,11 @@ func (s *Store) ReplayDelivery(ctx context.Context, tenantID, id string) error {
 		return nil
 	}
 	var exists bool
-	if err := s.Pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM deliveries WHERE id = $1 AND tenant_id = $2)`,
-		id, tenantID).Scan(&exists); err != nil {
+	if err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM deliveries WHERE id = $1 AND tenant_id = $2)`,
+			id, tenantID).Scan(&exists)
+	}); err != nil {
 		return err
 	}
 	if !exists {

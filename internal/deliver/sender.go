@@ -4,13 +4,16 @@ package deliver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"webhookdelivery/internal/sign"
+	"webhookdelivery/internal/ssrf"
 )
 
 const (
@@ -40,21 +43,34 @@ func (r Result) Success() bool {
 }
 
 type Sender struct {
-	client *http.Client
+	client       *http.Client
+	allowPrivate bool
 }
+
+// ErrInsecureURL is returned for a non-https target when private targets are not allowed.
+var ErrInsecureURL = errors.New("refusing to deliver over plain http")
 
 // NewSender builds a sender whose requests are bounded by timeout in total.
 // Redirects are never followed and environment proxies are ignored.
-func NewSender(timeout time.Duration) *Sender {
+//
+// Unless allowPrivateTargets is set (development and tests only), deliveries
+// are https-only and connections to non-public addresses (loopback, private
+// ranges, link-local/cloud metadata, ...) are refused at connect time; see
+// package ssrf.
+func NewSender(timeout time.Duration, allowPrivateTargets bool) *Sender {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	if !allowPrivateTargets {
+		dialer.Control = ssrf.Control
+	}
 	transport := &http.Transport{
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		DialContext:         dialer.DialContext,
 		TLSHandshakeTimeout: 5 * time.Second,
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}
-	return &Sender{client: &http.Client{
+	return &Sender{allowPrivate: allowPrivateTargets, client: &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -65,6 +81,15 @@ func NewSender(timeout time.Duration) *Sender {
 
 func (s *Sender) Send(ctx context.Context, r Request) Result {
 	start := time.Now()
+	// Defense in depth: the API only accepts https URLs in production, but an
+	// endpoint stored while running in development must not be reachable over
+	// plain http after switching to production.
+	if u, err := url.Parse(r.URL); err != nil || (!s.allowPrivate && u.Scheme != "https") {
+		if err == nil {
+			err = ErrInsecureURL
+		}
+		return Result{Err: err}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.URL, bytes.NewReader(r.Body))
 	if err != nil {
 		return Result{Err: err}

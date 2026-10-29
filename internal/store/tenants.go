@@ -2,9 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func (s *Store) CreateTenant(ctx context.Context, name string) (Tenant, error) {
@@ -27,15 +24,28 @@ func (s *Store) CreateAPIKey(ctx context.Context, tenantID, prefix string, hash 
 }
 
 // AuthenticateKey resolves an API key hash to its tenant. Revoked keys and
-// suspended tenants resolve to ErrNotFound.
+// suspended tenants resolve to ErrNotFound. It calls a SECURITY DEFINER
+// function because the API database role may not read api_keys directly.
 func (s *Store) AuthenticateKey(ctx context.Context, hash []byte) (tenantID string, err error) {
-	err = s.Pool.QueryRow(ctx,
-		`SELECT k.tenant_id::text
-		   FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
-		  WHERE k.key_hash = $1 AND k.revoked_at IS NULL AND t.status = 'active'`,
-		hash).Scan(&tenantID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var id *string
+	if err = s.Pool.QueryRow(ctx, `SELECT authenticate_api_key($1)::text`, hash).Scan(&id); err != nil {
+		return "", err
+	}
+	if id == nil {
 		return "", ErrNotFound
 	}
-	return tenantID, err
+	return *id, nil
+}
+
+// RevokeAPIKey revokes the key with the given prefix (admin use).
+func (s *Store) RevokeAPIKey(ctx context.Context, prefix string) error {
+	tag, err := s.Pool.Exec(ctx,
+		`UPDATE api_keys SET revoked_at = now() WHERE key_prefix = $1 AND revoked_at IS NULL`, prefix)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

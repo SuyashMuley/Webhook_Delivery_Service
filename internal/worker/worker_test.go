@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +39,13 @@ func always(status int) func(int) response {
 type receiver struct {
 	srv *httptest.Server
 
+	// blackHole makes the receiver accept connections and never answer, like a
+	// hung upstream. active/maxActive count how many requests were in flight.
+	blackHole bool
+	release   chan struct{}
+	active    atomic.Int32
+	maxActive atomic.Int32
+
 	mu     sync.Mutex
 	hits   []hit
 	behave func(n int) response
@@ -47,19 +55,50 @@ type receiver struct {
 type hit struct {
 	at        time.Time
 	webhookID string
+	timestamp string
+	signature string
 	body      []byte
 	verifyErr error
+}
+
+func newBlackHole(t *testing.T) *receiver {
+	r := newReceiver(t, ok())
+	r.blackHole = true
+	r.release = make(chan struct{})
+	t.Cleanup(func() { close(r.release) }) // runs before the server's Close, which waits for handlers
+	return r
 }
 
 func newReceiver(t *testing.T, behave func(n int) response) *receiver {
 	r := &receiver{behave: behave}
 	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if r.blackHole {
+			// Read the body first: only then does Go watch the connection, so the
+			// handler ends when the client gives up instead of lingering and
+			// inflating the in-flight count.
+			_, _ = io.Copy(io.Discard, req.Body)
+			n := r.active.Add(1)
+			defer r.active.Add(-1)
+			for { // keep the high-water mark
+				m := r.maxActive.Load()
+				if n <= m || r.maxActive.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			select {
+			case <-req.Context().Done():
+			case <-r.release:
+			}
+			return
+		}
 		body, _ := io.ReadAll(req.Body)
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		err := sign.Verify(req.Header.Get("webhook-signature"), [][]byte{r.secret}, req.Header.Get("webhook-id"),
 			req.Header.Get("webhook-timestamp"), body, 5*time.Minute, time.Now())
-		r.hits = append(r.hits, hit{at: time.Now(), webhookID: req.Header.Get("webhook-id"), body: body, verifyErr: err})
+		r.hits = append(r.hits, hit{at: time.Now(), webhookID: req.Header.Get("webhook-id"),
+			timestamp: req.Header.Get("webhook-timestamp"), signature: req.Header.Get("webhook-signature"),
+			body: body, verifyErr: err})
 		resp := r.behave(len(r.hits))
 		for k, v := range resp.headers {
 			w.Header().Set(k, v)
@@ -92,6 +131,9 @@ type opts struct {
 	schedule    []time.Duration
 	maxAttempts int
 	lease       time.Duration
+	breaker     store.BreakerPolicy
+	concurrency int
+	sendTimeout time.Duration
 }
 
 type system struct {
@@ -115,11 +157,20 @@ func newSystem(t *testing.T, o opts) *system {
 	if o.lease == 0 {
 		o.lease = time.Minute
 	}
+	if o.breaker.Threshold == 0 {
+		o.breaker = store.DefaultBreaker()
+	}
+	if o.concurrency == 0 {
+		o.concurrency = 10
+	}
+	if o.sendTimeout == 0 {
+		o.sendTimeout = 5 * time.Second
+	}
 	st := testutil.NewStore(t)
 	_, key := testutil.NewTenant(t, st, "acme")
 
 	mux := http.NewServeMux()
-	api.New(st, discard(), api.Options{AllowInsecureURLs: true, MaxAttempts: o.maxAttempts}).Register(mux)
+	api.New(testutil.WithRole(t, st, store.RoleAPI), discard(), api.Options{AllowInsecureURLs: true, MaxAttempts: o.maxAttempts}).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &system{t: t, st: st, api: srv, key: key, o: o}
@@ -129,8 +180,10 @@ func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, ni
 
 func (s *system) startWorker() {
 	s.t.Helper()
-	w := worker.New(s.st, deliver.NewSender(5*time.Second), discard(), worker.Config{
-		ID: "test-worker", BatchSize: 10, TenantSlice: 10, Concurrency: 10,
+	ws := testutil.WithRole(s.t, s.st, store.RoleWorker)
+	ws.Breaker = s.o.breaker
+	w := worker.New(ws, deliver.NewSender(s.o.sendTimeout, true), discard(), worker.Config{
+		ID: "test-worker", BatchSize: 10, TenantSlice: 10, Concurrency: s.o.concurrency,
 		PollInterval: 20 * time.Millisecond, Lease: s.o.lease, ReaperInterval: 50 * time.Millisecond,
 		Retry: retry.Policy{Schedule: s.o.schedule, MaxRetryAfter: time.Hour},
 	})
@@ -197,6 +250,14 @@ func (s *system) waitFor(cond func() bool, what string) {
 func (s *system) count(query string, args ...any) (n int) {
 	_ = s.st.Pool.QueryRow(context.Background(), query, args...).Scan(&n)
 	return n
+}
+
+// exec runs SQL as the table owner (for arranging state the API cannot).
+func (s *system) exec(query string, args ...any) {
+	s.t.Helper()
+	if _, err := s.st.Pool.Exec(context.Background(), query, args...); err != nil {
+		s.t.Fatalf("%s: %v", query, err)
+	}
 }
 
 func (s *system) statusCount(status string) int {

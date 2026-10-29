@@ -43,6 +43,7 @@ func Run(ctx context.Context, log *slog.Logger, addr string, h http.Handler, shu
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    32 << 10,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,

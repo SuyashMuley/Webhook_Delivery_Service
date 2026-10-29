@@ -19,6 +19,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"webhookdelivery/internal/auth"
+	"webhookdelivery/internal/secretbox"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/migrations"
 )
@@ -60,6 +61,7 @@ func NewStore(t testing.TB) *store.Store {
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
+	st.Sealer = secretbox.DevKeyring()
 	t.Cleanup(func() {
 		st.Close()
 		admin, err := pgx.Connect(ctx, base)
@@ -72,6 +74,23 @@ func NewStore(t testing.TB) *store.Store {
 			t.Logf("drop test database %s: %v", name, err)
 		}
 	})
+	return st
+}
+
+// WithRole opens a second store on the same test database whose connections
+// run as the given restricted role (store.RoleAPI or store.RoleWorker). The
+// store returned by NewStore is the table owner, which bypasses row-level
+// security; use it for setup and assertions, and this one for the code under
+// test so grants and policies are exercised for real.
+func WithRole(t testing.TB, owner *store.Store, role string) *store.Store {
+	t.Helper()
+	st, err := store.Connect(context.Background(), owner.Pool.Config().ConnString(), store.WithRole(role))
+	if err != nil {
+		t.Fatalf("connect as %s: %v", role, err)
+	}
+	st.Sealer = owner.Sealer
+	st.Breaker = owner.Breaker
+	t.Cleanup(st.Close)
 	return st
 }
 

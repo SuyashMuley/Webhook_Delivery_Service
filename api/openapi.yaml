@@ -27,6 +27,16 @@ components:
         description: { type: string }
         event_types: { type: array, items: { type: string }, description: 'Event types to receive; "*" matches all.' }
         status: { type: string, enum: [active, paused, disabled] }
+        max_concurrency: { type: integer, minimum: 1, maximum: 100, description: "Deliveries allowed in flight to this endpoint at once (default 5)" }
+        health:
+          type: object
+          description: Circuit breaker state. While circuit_open_until is in the future the endpoint is not attempted.
+          properties:
+            consecutive_failures: { type: integer }
+            failing_since: { type: string, format: date-time, nullable: true }
+            circuit_open_until: { type: string, format: date-time, nullable: true }
+        disabled_at: { type: string, format: date-time, description: "Set when auto-disabled after failing continuously" }
+        disabled_reason: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         secret: { type: string, description: Signing secret; returned only when the endpoint is created. }
@@ -42,7 +52,13 @@ components:
         next_attempt_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         dead_at: { type: string, format: date-time, nullable: true }
-        dead_reason: { type: string, nullable: true, enum: [max_attempts, endpoint_gone, lease_expired] }
+        dead_reason: { type: string, nullable: true, enum: [max_attempts, endpoint_gone, endpoint_disabled, lease_expired] }
+    SecretInfo:
+      type: object
+      properties:
+        id: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true, description: "Set while the secret is in its rotation grace period" }
     Attempt:
       type: object
       properties:
@@ -68,7 +84,7 @@ components:
         event_id: { type: string, format: uuid }
         event_type: { type: string }
         endpoint_id: { type: string, format: uuid }
-        reason: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] }
+        reason: { type: string, enum: [max_attempts, endpoint_gone, endpoint_disabled, lease_expired] }
         attempt_count: { type: integer }
         last_status_code: { type: integer, nullable: true }
         last_error: { type: string, nullable: true }
@@ -92,6 +108,7 @@ paths:
                 description: { type: string }
                 event_types: { type: array, items: { type: string }, default: ["*"] }
                 secret: { type: string, description: "Optional whsec_ secret (base64, 16-64 bytes); generated if omitted" }
+                max_concurrency: { type: integer, minimum: 1, maximum: 100, default: 5 }
       responses:
         '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Endpoint' } } } }
         '400': { $ref: '#/components/responses/Error' }
@@ -130,7 +147,8 @@ paths:
                 url: { type: string }
                 description: { type: string }
                 event_types: { type: array, items: { type: string } }
-                status: { type: string, enum: [active, paused] }
+                status: { type: string, enum: [active, paused], description: "Setting active also re-enables an auto-disabled endpoint and resets its circuit breaker" }
+                max_concurrency: { type: integer, minimum: 1, maximum: 100 }
       responses:
         '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Endpoint' } } } }
         '404': { $ref: '#/components/responses/Error' }
@@ -139,6 +157,64 @@ paths:
       responses:
         '204': { description: Deleted }
         '404': { $ref: '#/components/responses/Error' }
+  /v1/endpoints/{id}/secrets:
+    get:
+      summary: List the endpoint's signing secrets (metadata only, never values)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SecretInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/endpoints/{id}/secrets/rotate:
+    post:
+      summary: Rotate the signing secret
+      description: |
+        Adds a new secret. For the grace period the previous secret keeps signing too and every delivery carries
+        a signature for each live secret, so the receiver can switch over with no failed deliveries.
+        `grace_period: "0s"` retires every previous secret immediately (hard rotation after a compromise).
+        The new secret is returned once.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_period: { type: string, example: 24h, description: "Go duration, 0s to 168h; default 24h" }
+                secret: { type: string, description: "Optional whsec_ secret; generated if omitted" }
+      responses:
+        '201':
+          description: Rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  secret: { type: string }
+                  created_at: { type: string, format: date-time }
+                  secrets: { type: array, items: { $ref: '#/components/schemas/SecretInfo' } }
+        '409': { description: Too many live secrets, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/endpoints/{id}/secrets/{secretId}:
+    delete:
+      summary: Revoke one secret immediately
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: secretId, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Revoked }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: The last live secret cannot be revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /v1/events:
     post:
       summary: Publish an event
@@ -202,7 +278,7 @@ paths:
       summary: List dead-lettered deliveries (newest first)
       parameters:
         - { name: endpoint_id, in: query, schema: { type: string, format: uuid } }
-        - { name: reason, in: query, schema: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] } }
+        - { name: reason, in: query, schema: { type: string, enum: [max_attempts, endpoint_gone, endpoint_disabled, lease_expired] } }
         - { name: since, in: query, schema: { type: string, format: date-time }, description: "Only entries dead-lettered at or after this time" }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
         - { name: after, in: query, schema: { type: string }, description: "Opaque cursor from next_after" }
@@ -230,7 +306,7 @@ paths:
               type: object
               properties:
                 endpoint_id: { type: string, format: uuid }
-                reason: { type: string, enum: [max_attempts, endpoint_gone, lease_expired] }
+                reason: { type: string, enum: [max_attempts, endpoint_gone, endpoint_disabled, lease_expired] }
                 since: { type: string, format: date-time }
                 limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
                 rate_per_second: { type: number, exclusiveMinimum: 0, maximum: 1000, default: 10 }

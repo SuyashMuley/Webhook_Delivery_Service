@@ -40,6 +40,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.Handle("PATCH /v1/endpoints/{id}", a.authenticate(a.updateEndpoint))
 	mux.Handle("DELETE /v1/endpoints/{id}", a.authenticate(a.deleteEndpoint))
 
+	mux.Handle("GET /v1/endpoints/{id}/secrets", a.authenticate(a.listSecrets))
+	mux.Handle("POST /v1/endpoints/{id}/secrets/rotate", a.authenticate(a.rotateSecret))
+	mux.Handle("DELETE /v1/endpoints/{id}/secrets/{secretId}", a.authenticate(a.revokeSecret))
+
 	mux.Handle("POST /v1/events", a.authenticate(a.createEvent))
 	mux.Handle("GET /v1/events/{id}/deliveries", a.authenticate(a.listEventDeliveries))
 

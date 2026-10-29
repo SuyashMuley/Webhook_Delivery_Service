@@ -2,13 +2,16 @@ package deliver
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"webhookdelivery/internal/sign"
+	"webhookdelivery/internal/ssrf"
 )
 
 func testRequest(url string) (Request, []byte) {
@@ -34,7 +37,7 @@ func TestSendSignsRequest(t *testing.T) {
 	defer srv.Close()
 
 	req, key := testRequest(srv.URL)
-	res := NewSender(5*time.Second).Send(context.Background(), req)
+	res := NewSender(5*time.Second, true).Send(context.Background(), req)
 	if !res.Success() || res.StatusCode != http.StatusNoContent {
 		t.Fatalf("result = %+v", res)
 	}
@@ -57,7 +60,7 @@ func TestSendClassifiesResponses(t *testing.T) {
 			w.WriteHeader(code)
 		}))
 		req, _ := testRequest(srv.URL)
-		res := NewSender(5*time.Second).Send(context.Background(), req)
+		res := NewSender(5*time.Second, true).Send(context.Background(), req)
 		srv.Close()
 		if res.Success() || res.StatusCode == 0 {
 			t.Errorf("code %d: result = %+v, want a non-success response", code, res)
@@ -73,7 +76,7 @@ func TestSendDoesNotFollowRedirects(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := testRequest(srv.URL)
-	res := NewSender(5*time.Second).Send(context.Background(), req)
+	res := NewSender(5*time.Second, true).Send(context.Background(), req)
 	if hit || res.StatusCode != http.StatusTemporaryRedirect || res.Success() {
 		t.Fatalf("redirect followed or treated as success: hit=%v res=%+v", hit, res)
 	}
@@ -89,7 +92,7 @@ func TestSendTimeout(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := testRequest(srv.URL)
-	res := NewSender(100*time.Millisecond).Send(context.Background(), req)
+	res := NewSender(100*time.Millisecond, true).Send(context.Background(), req)
 	if res.Err == nil || res.Success() {
 		t.Fatalf("expected timeout error, got %+v", res)
 	}
@@ -119,5 +122,37 @@ func TestParseRetryAfter(t *testing.T) {
 		if got := parseRetryAfter(in, now); got != want {
 			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+func TestProductionSenderRefusesInternalAndInsecureTargets(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("request reached an internal server")
+	}))
+	defer srv.Close()
+	prod := NewSender(5*time.Second, false)
+
+	// plain http is refused before any connection is made
+	req, _ := testRequest(srv.URL)
+	if res := prod.Send(context.Background(), req); !errors.Is(res.Err, ErrInsecureURL) {
+		t.Errorf("http target: got %+v, want ErrInsecureURL", res)
+	}
+
+	// https to a loopback address is refused at connect time
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("request reached an internal TLS server")
+	}))
+	defer tlsSrv.Close()
+	req, _ = testRequest(tlsSrv.URL)
+	res := prod.Send(context.Background(), req)
+	var blocked *ssrf.BlockedError
+	if !errors.As(res.Err, &blocked) {
+		t.Errorf("loopback https target: got %+v, want BlockedError", res)
+	}
+
+	// a hostname that resolves to loopback (what DNS rebinding relies on) is refused too
+	req, _ = testRequest(strings.Replace(tlsSrv.URL, "127.0.0.1", "localhost", 1))
+	if res := prod.Send(context.Background(), req); !errors.As(res.Err, &blocked) {
+		t.Errorf("hostname resolving to loopback: got %+v, want BlockedError", res)
 	}
 }

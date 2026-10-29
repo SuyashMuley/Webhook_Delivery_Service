@@ -43,9 +43,11 @@ func TestClaimIsExclusiveAcrossConcurrentWorkers(t *testing.T) {
 	st := testutil.NewStore(t)
 	const total = 300
 	seed(t, st, total)
-	// This test never completes deliveries; lift the in-flight cap so it
-	// measures exclusivity, not the cap (see TestClaimRespectsTenantMaxInflight).
-	if _, err := st.Pool.Exec(context.Background(), `UPDATE tenants SET max_inflight = 1000000`); err != nil {
+	// This test never completes deliveries; lift the in-flight caps so it
+	// measures exclusivity, not the caps (see TestClaimRespectsTenantMaxInflight
+	// and TestClaimRespectsEndpointConcurrency).
+	if _, err := st.Pool.Exec(context.Background(),
+		`UPDATE tenants SET max_inflight = 1000000; UPDATE endpoints SET max_concurrency = 1000000`); err != nil {
 		t.Fatal(err)
 	}
 

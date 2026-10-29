@@ -1,7 +1,12 @@
 DATABASE_URL ?= postgres://webhooks:webhooks@localhost:5432/webhooks?sslmode=disable
 export DATABASE_URL
 
-.PHONY: build test lint vet up down migrate-up migrate-down migrate-status run-api run-worker
+# Claim-query benchmark (see docs/plan.md, "Claiming").
+bench:
+	docker compose up -d postgres --wait
+	go test ./internal/store -run xxx -bench ClaimParallel -benchtime 2000x -cpu 1,8
+
+.PHONY: bench build test lint vet up down migrate-up migrate-down migrate-status run-api run-worker
 
 build:
 	go build ./...

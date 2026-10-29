@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"webhookdelivery/internal/secretbox"
 )
 
 func env(m map[string]string) func(string) string {
@@ -11,7 +13,7 @@ func env(m map[string]string) func(string) string {
 }
 
 func TestLoadDefaults(t *testing.T) {
-	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080")
+	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +23,8 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadProdDefaultsToJSONLogs(t *testing.T) {
-	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "APP_ENV": "prod"}), ":8080")
+	key, _ := secretbox.GenerateKey("k1")
+	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "APP_ENV": "prod", "SECRET_ENCRYPTION_KEYS": key}), ":8080", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,14 +36,14 @@ func TestLoadProdDefaultsToJSONLogs(t *testing.T) {
 func TestLoadRejectsLeaseShorterThanTimeout(t *testing.T) {
 	_, err := load(env(map[string]string{
 		"DATABASE_URL": "postgres://x", "DELIVERY_TIMEOUT": "30s", "LEASE_DURATION": "10s",
-	}), ":8080")
+	}), ":8080", "")
 	if err == nil || !strings.Contains(err.Error(), "LEASE_DURATION") {
 		t.Fatalf("want lease error, got %v", err)
 	}
 }
 
 func TestLoadReportsAllErrors(t *testing.T) {
-	_, err := load(env(map[string]string{"APP_ENV": "staging", "SHUTDOWN_TIMEOUT": "soon"}), ":8080")
+	_, err := load(env(map[string]string{"APP_ENV": "staging", "SHUTDOWN_TIMEOUT": "soon"}), ":8080", "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -51,8 +54,49 @@ func TestLoadReportsAllErrors(t *testing.T) {
 	}
 }
 
+func TestLoadSecurityDefaults(t *testing.T) {
+	dev, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080", "webhooks_api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dev.AllowPrivateTargets || dev.DBRole != "webhooks_api" {
+		t.Fatalf("dev defaults: %+v", dev)
+	}
+	if ring, err := dev.Keyring(); err != nil || ring.ActiveKeyID() != "dev" {
+		t.Fatalf("dev should fall back to the dev keyring: %v", err)
+	}
+
+	key, _ := secretbox.GenerateKey("k1")
+	prod, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "APP_ENV": "prod", "SECRET_ENCRYPTION_KEYS": key}), ":8080", "webhooks_worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prod.AllowPrivateTargets {
+		t.Fatal("production must not allow private targets by default")
+	}
+	if ring, _ := prod.Keyring(); ring.ActiveKeyID() != "k1" {
+		t.Fatal("production keyring not loaded")
+	}
+
+	off, _ := load(env(map[string]string{"DATABASE_URL": "postgres://x", "DB_ROLE": "none"}), ":8080", "webhooks_api")
+	if off.DBRole != "" {
+		t.Fatalf("DB_ROLE=none should disable role switching, got %q", off.DBRole)
+	}
+}
+
+func TestProductionRequiresEncryptionKeys(t *testing.T) {
+	_, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "APP_ENV": "prod"}), ":8080", "")
+	if err == nil || !strings.Contains(err.Error(), "SECRET_ENCRYPTION_KEYS") {
+		t.Fatalf("want SECRET_ENCRYPTION_KEYS error, got %v", err)
+	}
+	_, err = load(env(map[string]string{"DATABASE_URL": "postgres://x", "SECRET_ENCRYPTION_KEYS": "garbage"}), ":8080", "")
+	if err == nil || !strings.Contains(err.Error(), "SECRET_ENCRYPTION_KEYS") {
+		t.Fatalf("a malformed key must be rejected even in dev, got %v", err)
+	}
+}
+
 func TestLoadRetrySchedule(t *testing.T) {
-	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "RETRY_SCHEDULE": "1s, 2m,1h"}), ":8080")
+	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "RETRY_SCHEDULE": "1s, 2m,1h"}), ":8080", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,14 +105,14 @@ func TestLoadRetrySchedule(t *testing.T) {
 		t.Fatalf("schedule = %v, want %v", c.RetrySchedule, want)
 	}
 
-	if _, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "RETRY_SCHEDULE": "1s,nope,-5s"}), ":8080"); err == nil ||
+	if _, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "RETRY_SCHEDULE": "1s,nope,-5s"}), ":8080", ""); err == nil ||
 		!strings.Contains(err.Error(), "RETRY_SCHEDULE") {
 		t.Fatalf("want RETRY_SCHEDULE error, got %v", err)
 	}
 }
 
 func TestLoadDefaultRetrySettings(t *testing.T) {
-	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080")
+	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080", "")
 	if err != nil {
 		t.Fatal(err)
 	}

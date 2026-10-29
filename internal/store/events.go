@@ -15,7 +15,7 @@ import (
 // most maxAttempts times before it is sent to the DLQ.
 func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, payload json.RawMessage, idemKey string, maxAttempts int) (IngestResult, error) {
 	var res IngestResult
-	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var key *string
 		if idemKey != "" {
 			key = &idemKey
@@ -56,28 +56,33 @@ func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, pay
 // ListEventDeliveries returns the deliveries created for one of the tenant's
 // events, or ErrNotFound if the event does not exist for that tenant.
 func (s *Store) ListEventDeliveries(ctx context.Context, tenantID, eventID string) ([]DeliverySummary, error) {
-	var exists bool
-	if err := s.Pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM events WHERE id = $1 AND tenant_id = $2)`,
-		eventID, tenantID).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, ErrNotFound
-	}
+	var out []DeliverySummary
+	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM events WHERE id = $1 AND tenant_id = $2)`,
+			eventID, tenantID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
 
-	rows, err := s.Pool.Query(ctx,
-		`SELECT id::text, endpoint_id::text, status, attempt_count, last_status_code,
-		        last_error, next_attempt_at, created_at, dead_at, dead_reason
-		   FROM deliveries WHERE event_id = $1 AND tenant_id = $2
-		  ORDER BY created_at, id`, eventID, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (DeliverySummary, error) {
-		var d DeliverySummary
-		err := r.Scan(&d.ID, &d.EndpointID, &d.Status, &d.AttemptCount, &d.LastStatusCode,
-			&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt, &d.DeadReason)
-		return d, err
+		rows, err := tx.Query(ctx,
+			`SELECT id::text, endpoint_id::text, status, attempt_count, last_status_code,
+			        last_error, next_attempt_at, created_at, dead_at, dead_reason
+			   FROM deliveries WHERE event_id = $1 AND tenant_id = $2
+			  ORDER BY created_at, id`, eventID, tenantID)
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (DeliverySummary, error) {
+			var d DeliverySummary
+			err := r.Scan(&d.ID, &d.EndpointID, &d.Status, &d.AttemptCount, &d.LastStatusCode,
+				&d.LastError, &d.NextAttemptAt, &d.CreatedAt, &d.DeadAt, &d.DeadReason)
+			return d, err
+		})
+		return err
 	})
+	return out, err
 }

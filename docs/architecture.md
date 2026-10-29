@@ -56,7 +56,7 @@ erDiagram
 
     TENANTS { uuid id PK; text status; int max_inflight; int events_per_sec; int max_pending }
     API_KEYS { uuid id PK; uuid tenant_id FK; text key_hash; text[] scopes; timestamptz revoked_at }
-    ENDPOINTS { uuid id PK; uuid tenant_id FK; text url; text[] event_types; jsonb secrets; text status; int consecutive_failures; timestamptz circuit_open_until }
+    ENDPOINTS { uuid id PK; uuid tenant_id FK; text url; text[] event_types; jsonb secrets_sealed; text status; int max_concurrency; int consecutive_failures; int circuit_trips; timestamptz circuit_open_until; timestamptz failing_since; text disabled_reason }
     EVENTS { uuid id PK; uuid tenant_id FK; text type; jsonb payload; text idempotency_key }
     DELIVERIES { uuid id PK; uuid event_id FK; uuid endpoint_id FK; text status; int attempt_count; timestamptz next_attempt_at; timestamptz lease_expires_at; text dead_reason }
     ATTEMPTS { uuid id PK; uuid delivery_id FK; int attempt_no; int status_code; int duration_ms; text error }
@@ -92,12 +92,12 @@ sequenceDiagram
     participant D as Postgres
     participant E as Customer endpoint
     loop poll
-        W->>D: claim batch (SKIP LOCKED, fair per tenant, tenant in-flight cap; skips paused endpoints) → in_flight + lease
+        W->>D: claim batch (SKIP LOCKED; fair per tenant; per-endpoint concurrency cap; skips paused/disabled endpoints and open circuits) → in_flight + lease
         par for each delivery (bounded concurrency)
-            W->>W: check circuit breaker, build signed request
-            W->>E: POST (SSRF-safe dialer, 10s timeout, no redirects)
+            W->>W: decrypt secrets, sign with every live secret
+            W->>E: POST (SSRF-checked dial, 10s timeout, no redirects)
             E-->>W: status / error
-            W->>D: INSERT attempt; UPDATE delivery
+            W->>D: INSERT attempt; UPDATE delivery; update endpoint health (breaker)
         end
     end
 ```
@@ -133,21 +133,34 @@ stateDiagram-v2
 
 ## 6. Isolation and Fairness
 
-| Risk | Control |
-|---|---|
-| Tenant floods events | Per-tenant token bucket at ingest; `max_pending` quota (429) |
-| Tenant dominates workers | Per-tenant `max_inflight`; claim takes at most K rows per tenant per batch |
-| Slow endpoint hogs worker slots | Per-endpoint `max_concurrency`; circuit breaker with half-open probe |
-| Cross-tenant data access | `tenant_id` on every table, scoped queries, Postgres row-level security |
+| Risk | Control | Status |
+|---|---|---|
+| Tenant floods events | Per-tenant token bucket at ingest; `max_pending` quota (429) | Phase 4 |
+| Tenant dominates workers | Per-tenant `max_inflight` (soft); each claim takes at most a slice per tenant, tenants visited in random order | Done |
+| Slow or dead endpoint hogs worker slots | Per-endpoint `max_concurrency` enforced in the claim query (default 5) | Done |
+| Endpoint that keeps failing | Circuit breaker: opens after N consecutive failures, exponential open window, single half-open probe; auto-disable after a long failure streak | Done |
+| Cross-tenant data access | `tenant_id` on every table and every query, **plus** Postgres row-level security (below) | Done |
+
+**Circuit breaker.** State lives on the endpoint row (`consecutive_failures`, `circuit_trips`, `circuit_open_until`, `failing_since`). Only endpoint faults count: 429 (the receiver is alive, just busy) and failures on our side (undecryptable secrets) do not. While the circuit is open the endpoint is skipped by the claim query, so its deliveries simply wait and do not burn their attempts. When the window passes the endpoint is half-open: concurrency is forced to 1 so a single probe goes out. A successful delivery closes the circuit and resets everything; a failed probe re-opens it for twice as long, up to a cap. If an endpoint fails continuously for `AUTO_DISABLE_AFTER` (default 72h) it is disabled and its waiting deliveries are dead-lettered as `endpoint_disabled`, where they can be replayed after the tenant fixes the endpoint and sets `status: active` (which also resets the breaker).
+
+**Row-level security.** Two NOLOGIN group roles carry the privileges, and the API and worker connections run as them (`SET ROLE` on every pooled connection):
+
+| Role | Sees | Can do |
+|---|---|---|
+| `webhooks_api` | only the tenant in the transaction-local `app.tenant_id` (no tenant set: no rows) | CRUD endpoints, insert events, replay deliveries; **no access to `tenants` or `api_keys`** |
+| `webhooks_worker` | all tenants (it delivers for everyone) | claim and update deliveries/endpoints, insert attempts; cannot delete endpoints, insert events or read keys |
+
+Every tenant-facing store method runs in a transaction that first sets `app.tenant_id`, so a query that forgets its own `WHERE tenant_id = ...` returns nothing instead of leaking. API-key lookup happens before the tenant is known, so it goes through a `SECURITY DEFINER` function (`authenticate_api_key`) that the API role may execute. The table owner (migrations, `admin` CLI) is exempt. In production, connect with a login user that holds only the restricted role (or `DB_ROLE=none`), since a session that merely `SET ROLE`d can `RESET ROLE`.
 
 ## 7. Security Architecture
 
-- **AuthN**: per-tenant API keys; only SHA-256 hashes stored; prefix shown for identification; revocable.
-- **Payload integrity**: HMAC-SHA256 over `{id}.{timestamp}.{body}` (Standard Webhooks headers); multiple active secrets for zero-downtime rotation; timestamp enables replay rejection.
-- **SSRF**: HTTPS only in production; custom dialer resolves DNS, rejects private/loopback/link-local/metadata ranges, and connects to the pinned IP (anti-DNS-rebinding); redirects not followed.
-- **Secrets at rest**: endpoint signing secrets encrypted with envelope encryption (KMS in production).
-- **Limits**: 256KB event size, 64KB response read, 10s request timeout.
-- **Container/runtime**: non-root distroless images, read-only filesystem, NetworkPolicy restricting egress/ingress, `govulncheck` in CI.
+- **AuthN**: per-tenant API keys; only SHA-256 hashes stored; prefix shown for identification; revocable (`admin revoke-key`). Lookup goes through a definer function so the API role never reads the key table.
+- **Payload integrity**: HMAC-SHA256 over `{id}.{timestamp}.{body}` (Standard Webhooks headers); timestamp enables replay rejection.
+- **Secret rotation**: an endpoint holds several secrets. Rotating (`POST /v1/endpoints/{id}/secrets/rotate`) adds a new one and keeps the old one signing for a grace period (default 24h, max 7d), and while both are live every delivery carries a signature for each, so a receiver can switch at any point in that window with no failed deliveries. `grace_period: "0s"` is the hard rotation for a compromise: it retires every previous secret immediately. At most 5 live secrets; the last one cannot be revoked.
+- **Secrets at rest**: envelope encryption (`internal/secretbox`). Each secret is AES-256-GCM encrypted under its own random data key, which is wrapped by a key-encryption key from a keyring; the ciphertext is bound (AAD) to its endpoint and secret id, so a sealed secret copied onto another endpoint will not open. Keys come from `SECRET_ENCRYPTION_KEYS` (`id:base64`, first is active, older ones kept for reading); `admin encrypt-secrets` migrates plaintext secrets and re-seals after a key rotation. The `Sealer` interface is where a cloud KMS plugs in. Production refuses to start without keys; development falls back to a public dev key and logs a warning.
+- **SSRF** (`internal/ssrf`, `internal/deliver`): the check runs in the dialer's `Control` hook on the IP actually being connected to, after DNS resolution, so it cannot be bypassed by a hostname that resolves (or later rebinds) to an internal address. Blocked: loopback, RFC 1918, link-local including the 169.254.169.254 metadata service, CGNAT, multicast/reserved, IPv6 ULA/link-local, IPv4-mapped forms, NAT64 and 6to4. Production also refuses plain `http` at send time, never follows redirects, and ignores proxy environment variables. Registration rejects obviously internal hosts for fast feedback, but that is advisory. `ALLOW_PRIVATE_TARGETS` (default on only in dev) lifts the restrictions.
+- **Limits**: 256KB event payload, 16KB request bodies on management endpoints, 32KB request headers, 64KB response read, 10s delivery timeout, API server read/write/idle timeouts.
+- **Container/runtime**: non-root distroless images, `govulncheck` in CI. Kubernetes NetworkPolicy and read-only filesystems arrive with the deployment manifests in Phase 4.
 
 ## 8. Observability
 

@@ -19,7 +19,15 @@ services:
     build: { context: ., args: { CMD: migrate } }
     environment: &env
       DATABASE_URL: postgres://webhooks:webhooks@postgres:5432/webhooks?sslmode=disable
-      APP_ENV: dev
+      APP_ENV: ${APP_ENV:-dev}
+      # Security (see README). Unset in dev: a public development key is used and
+      # private delivery targets are allowed. APP_ENV=prod requires real keys.
+      SECRET_ENCRYPTION_KEYS: ${SECRET_ENCRYPTION_KEYS:-}
+      ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-}
+      BREAKER_BASE_OPEN: ${BREAKER_BASE_OPEN:-}
+      BREAKER_MAX_OPEN: ${BREAKER_MAX_OPEN:-}
+      AUTO_DISABLE_AFTER: ${AUTO_DISABLE_AFTER:-}
       # Optional overrides, e.g. `RETRY_SCHEDULE=1s,2s MAX_ATTEMPTS=3 docker compose up`.
       # Blank means "use the default".
       MAX_ATTEMPTS: ${MAX_ATTEMPTS:-}

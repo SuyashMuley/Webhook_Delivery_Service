@@ -97,29 +97,33 @@ func (w *Worker) process(d store.ClaimedDelivery) {
 		return // lease expires and the reaper (Phase 2) will recover it
 	}
 
-	var secrets [][]byte
-	for _, s := range d.Secrets {
-		if key, err := sign.ParseSecret(s.Value); err == nil {
-			secrets = append(secrets, key)
-		} else {
-			log.Warn("skipping unparseable secret", "secret_id", s.ID, "error", err)
-		}
-	}
-
 	started := time.Now()
-	res := w.sender.Send(context.Background(), deliver.Request{
-		URL:       d.URL,
-		ID:        d.EventID,
-		Timestamp: started,
-		Body:      body,
-		Secrets:   secrets,
-	})
+	var res deliver.Result
+	local := false
+	switch secrets := signingKeys(log, d.Secrets, started); {
+	case d.SecretsErr != nil:
+		// Not the endpoint's fault, and sending unsigned would be worse than not
+		// sending: fail the attempt so it is retried (and visible) later.
+		log.Error("cannot decrypt signing secrets", "error", d.SecretsErr)
+		res, local = deliver.Result{Err: errors.New("cannot decrypt the endpoint's signing secrets")}, true
+	case len(secrets) == 0:
+		res, local = deliver.Result{Err: errors.New("endpoint has no live signing secret")}, true
+	default:
+		res = w.sender.Send(context.Background(), deliver.Request{
+			URL:       d.URL,
+			ID:        d.EventID,
+			Timestamp: started,
+			Body:      body,
+			Secrets:   secrets,
+		})
+	}
 
 	attempt := store.Attempt{
 		StartedAt:   started,
 		Duration:    res.Duration,
 		StatusCode:  res.StatusCode,
 		BodySnippet: res.BodySnippet,
+		Local:       local,
 	}
 	if res.Err != nil {
 		attempt.Error = res.Err.Error()
@@ -204,4 +208,23 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
+}
+
+// signingKeys returns the key bytes of every secret that may sign at time now:
+// during a rotation the old and new secrets both sign, so receivers can verify
+// with either.
+func signingKeys(log *slog.Logger, secrets []store.Secret, now time.Time) [][]byte {
+	var keys [][]byte
+	for _, s := range secrets {
+		if !s.Live(now) {
+			continue
+		}
+		key, err := sign.ParseSecret(s.Value)
+		if err != nil {
+			log.Warn("skipping unparseable secret", "secret_id", s.ID, "error", err)
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
 }

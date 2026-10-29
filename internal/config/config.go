@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"webhookdelivery/internal/retry"
+	"webhookdelivery/internal/secretbox"
 )
 
 type Config struct {
@@ -33,15 +34,37 @@ type Config struct {
 	MaxAttempts   int             // attempts per delivery before it goes to the DLQ
 	RetrySchedule []time.Duration // nominal wait after the 1st, 2nd, ... failed attempt
 	RetryAfterMax time.Duration   // upper bound on honoring a receiver's Retry-After
+
+	// Circuit breaker.
+	BreakerThreshold int           // consecutive failures that open an endpoint's circuit
+	BreakerBaseOpen  time.Duration // first open window; doubles each re-open
+	BreakerMaxOpen   time.Duration
+	AutoDisableAfter time.Duration // continuous failure time after which an endpoint is disabled (0 = never)
+
+	// Security.
+	AllowPrivateTargets bool   // permit http:// endpoint URLs and private/loopback destinations (dev only)
+	SecretKeys          string // SECRET_ENCRYPTION_KEYS: "id:base64key[,id:base64key...]", first is active
+	DBRole              string // database role to run as ("" = stay as the login user)
 }
 
-// Load reads configuration from the environment. defaultHTTPAddr lets each
-// binary pick its own listen address without needing separate variables.
-func Load(defaultHTTPAddr string) (Config, error) {
-	return load(os.Getenv, defaultHTTPAddr)
+// Keyring builds the key-encryption keyring for endpoint secrets. Development
+// falls back to a fixed, public key so the stack runs with no setup; production
+// refuses to start without real keys (see load).
+func (c Config) Keyring() (*secretbox.Keyring, error) {
+	if c.SecretKeys == "" {
+		return secretbox.DevKeyring(), nil
+	}
+	return secretbox.ParseKeyring(c.SecretKeys)
 }
 
-func load(get func(string) string, defaultHTTPAddr string) (Config, error) {
+// Load reads configuration from the environment. defaultHTTPAddr and
+// defaultDBRole let each binary pick its own listen address and restricted
+// database role without needing separate variables.
+func Load(defaultHTTPAddr, defaultDBRole string) (Config, error) {
+	return load(os.Getenv, defaultHTTPAddr, defaultDBRole)
+}
+
+func load(get func(string) string, defaultHTTPAddr, defaultDBRole string) (Config, error) {
 	var errs []error
 	c := Config{
 		Env:         or(get("APP_ENV"), "dev"),
@@ -62,7 +85,19 @@ func load(get func(string) string, defaultHTTPAddr string) (Config, error) {
 		MaxAttempts:   integer(get, "MAX_ATTEMPTS", 8, &errs),
 		RetryAfterMax: duration(get, "RETRY_AFTER_MAX", "6h", &errs),
 		RetrySchedule: schedule(get, "RETRY_SCHEDULE", retry.DefaultSchedule, &errs),
+
+		BreakerThreshold: integer(get, "BREAKER_THRESHOLD", 20, &errs),
+		BreakerBaseOpen:  duration(get, "BREAKER_BASE_OPEN", "30s", &errs),
+		BreakerMaxOpen:   duration(get, "BREAKER_MAX_OPEN", "1h", &errs),
+		AutoDisableAfter: duration(get, "AUTO_DISABLE_AFTER", "72h", &errs),
+
+		SecretKeys: strings.TrimSpace(get("SECRET_ENCRYPTION_KEYS")),
+		DBRole:     or(get("DB_ROLE"), defaultDBRole),
 	}
+	if c.DBRole == "none" {
+		c.DBRole = ""
+	}
+	c.AllowPrivateTargets = boolean(get, "ALLOW_PRIVATE_TARGETS", c.Env == "dev", &errs)
 	if c.LogFormat == "" {
 		c.LogFormat = "text"
 		if c.Env == "prod" {
@@ -84,6 +119,19 @@ func load(get func(string) string, defaultHTTPAddr string) (Config, error) {
 	}
 	if c.TenantSlice < 1 || c.MaxAttempts < 1 {
 		errs = append(errs, errors.New("WORKER_TENANT_SLICE and MAX_ATTEMPTS must be >= 1"))
+	}
+	if c.BreakerThreshold < 1 || c.BreakerBaseOpen <= 0 || c.BreakerMaxOpen < c.BreakerBaseOpen {
+		errs = append(errs, errors.New("BREAKER_THRESHOLD must be >= 1 and BREAKER_MAX_OPEN >= BREAKER_BASE_OPEN > 0"))
+	}
+	if c.Env == "prod" {
+		if c.SecretKeys == "" {
+			errs = append(errs, errors.New("SECRET_ENCRYPTION_KEYS is required when APP_ENV=prod (generate one with: admin gen-secret-key <id>)"))
+		}
+	}
+	if c.SecretKeys != "" {
+		if _, err := secretbox.ParseKeyring(c.SecretKeys); err != nil {
+			errs = append(errs, fmt.Errorf("SECRET_ENCRYPTION_KEYS: %w", err))
+		}
 	}
 	if c.LeaseDuration <= c.DeliveryTimeout {
 		errs = append(errs, errors.New("LEASE_DURATION must be longer than DELIVERY_TIMEOUT"))
@@ -116,6 +164,18 @@ func schedule(get func(string) string, key string, def []time.Duration, errs *[]
 		out = append(out, d)
 	}
 	return out
+}
+
+func boolean(get func(string) string, key string, def bool, errs *[]error) bool {
+	v := strings.TrimSpace(get(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %w", key, err))
+	}
+	return b
 }
 
 func integer(get func(string) string, key string, def int, errs *[]error) int {

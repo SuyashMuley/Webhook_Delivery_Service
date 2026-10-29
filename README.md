@@ -2,7 +2,7 @@
 
 Multi-tenant webhook delivery service with retries and a dead letter queue. See [docs/architecture.md](docs/architecture.md) for the design and [docs/plan.md](docs/plan.md) for the build plan.
 
-**Status:** Phases 0-2 complete: events fan out to subscribed endpoints and are delivered signed, with scheduled retries, a dead letter queue with replay, and recovery from crashed workers. Next: isolation and security hardening (Phase 3).
+**Status:** Phases 0-3 complete: events fan out to subscribed endpoints and are delivered signed, with scheduled retries, a dead letter queue with replay, crash recovery, per-endpoint isolation (concurrency caps and a circuit breaker), SSRF protection, encrypted and rotatable secrets, and database-enforced tenant isolation. Next: observability and ops (Phase 4).
 
 ## Run locally
 
@@ -40,6 +40,32 @@ curl -s -X POST localhost:8080/v1/deliveries/$ID/replay -H "Authorization: Beare
 curl -s localhost:8080/v1/dlq/replay -H "Authorization: Bearer $KEY" -d '{"reason":"max_attempts","rate_per_second":5}'
 ```
 
+### Secret rotation, security and isolation
+
+```sh
+# Rotate with a 24h grace period: deliveries carry signatures for both secrets, so receivers can switch with no downtime.
+curl -s -X POST localhost:8080/v1/endpoints/$EP/secrets/rotate -H "Authorization: Bearer $KEY" -d '{"grace_period":"24h"}'
+curl -s localhost:8080/v1/endpoints/$EP/secrets -H "Authorization: Bearer $KEY"        # ids and expiry, never values
+curl -s -X DELETE localhost:8080/v1/endpoints/$EP/secrets/$SECRET_ID -H "Authorization: Bearer $KEY"
+# After a compromise: retire every previous secret immediately.
+curl -s -X POST localhost:8080/v1/endpoints/$EP/secrets/rotate -H "Authorization: Bearer $KEY" -d '{"grace_period":"0s"}'
+
+curl -s localhost:8080/v1/endpoints/$EP -H "Authorization: Bearer $KEY"   # status, max_concurrency and the circuit breaker's `health`
+curl -s -X PATCH localhost:8080/v1/endpoints/$EP -H "Authorization: Bearer $KEY" -d '{"status":"active"}'   # re-enable an auto-disabled endpoint and reset its breaker
+```
+
+Production needs real settings (development defaults are deliberately insecure and the services log a warning):
+
+| Setting | Purpose |
+|---|---|
+| `APP_ENV=prod` | https-only endpoints, no private/loopback delivery targets, JSON logs, requires `SECRET_ENCRYPTION_KEYS` |
+| `SECRET_ENCRYPTION_KEYS` | `id:base64key[,id:base64key...]`; first is active, others only decrypt. Generate with `go run ./cmd/admin gen-secret-key k1`. After rotating keys run `go run ./cmd/admin encrypt-secrets` |
+| `DB_ROLE` | role the service runs as (`webhooks_api` / `webhooks_worker` by default; `none` to disable). See `docs/architecture.md` for using restricted login users |
+| `ALLOW_PRIVATE_TARGETS` | override the private-target restriction (default: on only in dev) |
+| `BREAKER_THRESHOLD`, `BREAKER_BASE_OPEN`, `BREAKER_MAX_OPEN`, `AUTO_DISABLE_AFTER` | circuit breaker (20, 30s, 1h, 72h) |
+
+Other admin commands: `admin revoke-key <prefix>`, `admin gen-secret-key <id>`, `admin encrypt-secrets`. The migrating database user needs `CREATEROLE` (migration 00004 creates the two restricted roles).
+
 Retry settings (all optional): `MAX_ATTEMPTS` (8), `RETRY_SCHEDULE` (`30s,5m,30m,2h,5h,8h,8h`), `RETRY_AFTER_MAX` (6h), `WORKER_TENANT_SLICE` (5), `LEASE_DURATION`, `REAPER_INTERVAL`.
 
 API reference: [api/openapi.yaml](api/openapi.yaml).
@@ -58,6 +84,8 @@ internal/retry             backoff schedule and jitter
 internal/deliver           signed HTTP sender
 internal/sign              Standard Webhooks HMAC signing
 internal/auth              API key generation/hashing
+internal/secretbox         envelope encryption of endpoint secrets
+internal/ssrf              blocked-address policy enforced at connect time
 internal/config            env-based configuration
 internal/logging           slog setup
 internal/server            HTTP shell + /healthz, /readyz
@@ -69,4 +97,4 @@ docs/                      architecture.md, plan.md
 
 ## Checks
 
-`make vet test lint`. `make test` starts Postgres via Compose; integration tests are skipped if `DATABASE_URL` is unset. Lint needs `golangci-lint`.
+`make vet test lint`; `make bench` runs the claim-query benchmark. `make test` starts Postgres via Compose; integration tests are skipped if `DATABASE_URL` is unset. Lint needs `golangci-lint`.

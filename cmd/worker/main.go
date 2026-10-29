@@ -28,26 +28,48 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load(":8081")
+	cfg, err := config.Load(":8081", store.RoleWorker)
 	if err != nil {
 		return err
 	}
 	log := logging.New(os.Stderr, cfg.LogLevel, cfg.LogFormat, "worker")
 
+	ring, err := cfg.Keyring()
+	if err != nil {
+		return err
+	}
+	if cfg.SecretKeys == "" {
+		log.Warn("SECRET_ENCRYPTION_KEYS is not set: using the public development key; endpoint secrets are NOT protected")
+	}
+	if cfg.AllowPrivateTargets {
+		log.Warn("private/loopback delivery targets and plain http are allowed (development setting)")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Connect(ctx, cfg.DatabaseURL)
+	var opts []store.Option
+	if cfg.DBRole != "" {
+		opts = append(opts, store.WithRole(cfg.DBRole))
+	}
+	db, err := store.Connect(ctx, cfg.DatabaseURL, opts...)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	db.Sealer = ring
+	db.Breaker = store.BreakerPolicy{
+		Threshold:    cfg.BreakerThreshold,
+		BaseOpen:     cfg.BreakerBaseOpen,
+		MaxOpen:      cfg.BreakerMaxOpen,
+		DisableAfter: cfg.AutoDisableAfter,
+	}
 
 	id, err := workerID()
 	if err != nil {
 		return err
 	}
-	w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout), log, worker.Config{
+	w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout, cfg.AllowPrivateTargets), log, worker.Config{
 		ID:             id,
 		BatchSize:      cfg.WorkerBatchSize,
 		TenantSlice:    cfg.TenantSlice,
