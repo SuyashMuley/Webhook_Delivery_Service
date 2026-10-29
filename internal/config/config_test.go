@@ -120,3 +120,44 @@ func TestLoadDefaultRetrySettings(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 }
+
+func TestOperationalDefaults(t *testing.T) {
+	c, err := load(env(map[string]string{"DATABASE_URL": "postgres://x"}), ":8080", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MetricsAddr != ":9090" || c.DrainDelay != 3*time.Second || c.WorkerDrainTimeout != 20*time.Second ||
+		c.RetainSucceeded != 7*24*time.Hour || c.RetainDead != 30*24*time.Hour || c.PurgeInterval != 5*time.Minute {
+		t.Fatalf("unexpected operational defaults: %+v", c)
+	}
+	if c.TraceSampleRatio != 1 { // dev traces everything
+		t.Fatalf("dev sample ratio = %v, want 1", c.TraceSampleRatio)
+	}
+	key, _ := secretbox.GenerateKey("k1")
+	prod, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "APP_ENV": "prod", "SECRET_ENCRYPTION_KEYS": key}), ":8080", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prod.TraceSampleRatio != 0.1 {
+		t.Fatalf("prod sample ratio = %v, want 0.1 (sample a tenth of traces)", prod.TraceSampleRatio)
+	}
+}
+
+func TestOperationalSettingsAreValidated(t *testing.T) {
+	c, err := load(env(map[string]string{
+		"DATABASE_URL": "postgres://x", "METRICS_ADDR": "", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://jaeger:4318/",
+		"OTEL_TRACES_SAMPLER_ARG": "0.25", "PURGE_INTERVAL": "0s",
+	}), ":8080", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OTLPEndpoint != "http://jaeger:4318" || c.TraceSampleRatio != 0.25 || c.PurgeInterval != 0 {
+		t.Fatalf("settings not parsed: %+v", c)
+	}
+	for _, bad := range []string{"1.5", "-1", "lots"} {
+		if _, err := load(env(map[string]string{"DATABASE_URL": "postgres://x", "OTEL_TRACES_SAMPLER_ARG": bad}), ":8080", ""); err == nil ||
+			!strings.Contains(err.Error(), "OTEL_TRACES_SAMPLER_ARG") {
+			t.Errorf("sampler ratio %q accepted: %v", bad, err)
+		}
+	}
+}

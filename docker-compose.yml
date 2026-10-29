@@ -24,6 +24,17 @@ services:
       # private delivery targets are allowed. APP_ENV=prod requires real keys.
       SECRET_ENCRYPTION_KEYS: ${SECRET_ENCRYPTION_KEYS:-}
       ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-}
+      # Observability. OTEL_EXPORTER_OTLP_ENDPOINT enables trace export (`make up-obs` sets it).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-}
+      STATS_INTERVAL: ${STATS_INTERVAL:-}
+      WORKER_LISTEN: ${WORKER_LISTEN:-}
+      API_REQUEST_TIMEOUT: ${API_REQUEST_TIMEOUT:-}
+      PURGE_INTERVAL: ${PURGE_INTERVAL:-}
+      RETAIN_SUCCEEDED: ${RETAIN_SUCCEEDED:-}
+      RETAIN_DEAD: ${RETAIN_DEAD:-}
+      RETAIN_EVENTS: ${RETAIN_EVENTS:-}
+      WORKER_DRAIN_TIMEOUT: ${WORKER_DRAIN_TIMEOUT:-}
       BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-}
       BREAKER_BASE_OPEN: ${BREAKER_BASE_OPEN:-}
       BREAKER_MAX_OPEN: ${BREAKER_MAX_OPEN:-}
@@ -49,6 +60,7 @@ services:
 
   api:
     build: { context: ., args: { CMD: api } }
+    stop_grace_period: 45s   # readiness drain + connection drain; the default 10s would SIGKILL first
     environment: *env
     ports:
       - "8080:8080"
@@ -57,11 +69,44 @@ services:
 
   worker:
     build: { context: ., args: { CMD: worker } }
+    stop_grace_period: 45s   # WORKER_DRAIN_TIMEOUT (20s) + release; the default 10s would SIGKILL first
     environment: *env
     ports:
       - "8081:8081"
     depends_on:
       migrate: { condition: service_completed_successfully }
+
+  # ---- Observability (docker compose --profile observability up, or `make up-obs`) ----
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"      # local development only
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/webhook-delivery.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
 
 volumes:
   pgdata:

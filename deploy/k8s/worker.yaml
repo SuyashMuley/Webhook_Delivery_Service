@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-worker
+  labels: { app.kubernetes.io/name: webhook-worker, app.kubernetes.io/part-of: webhook-delivery }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1   # workers are stateless and claim from a shared queue; replacing them one at a time is safe
+      maxSurge: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: webhook-worker }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: webhook-worker, app.kubernetes.io/part-of: webhook-delivery }
+    spec:
+      serviceAccountName: webhook-worker
+      automountServiceAccountToken: false
+      # On SIGTERM a worker stops claiming, waits WORKER_DRAIN_TIMEOUT (20s) for in-flight
+      # deliveries, aborts and hands back any that remain. This must be longer than that.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: webhook-worker }
+      containers:
+        - name: worker
+          image: webhook-delivery-worker:latest
+          ports:
+            - { name: http, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: webhook-config }
+            - secretRef: { name: webhook-db-worker }
+            - secretRef: { name: webhook-encryption }
+          env:
+            - name: DB_ROLE
+              value: "none"   # the login user already holds only webhooks_worker
+            - name: HTTP_ADDR
+              value: ":8081"
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 250m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-worker-metrics
+  labels: { app.kubernetes.io/name: webhook-worker, app.kubernetes.io/component: metrics }
+spec:
+  clusterIP: None
+  selector: { app.kubernetes.io/name: webhook-worker }
+  ports:
+    - { name: metrics, port: 9090, targetPort: metrics }

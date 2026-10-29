@@ -1,0 +1,140 @@
+# Default deny, then open only what each workload needs. The namespace labels
+# below (ingress-nginx, monitoring, database, observability) are assumptions:
+# adjust the selectors to match your cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-all }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: api }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: webhook-api }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:   # producers reach the API only through the ingress controller
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:     # Postgres
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: database }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:     # OTLP trace collector
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 4318 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: worker }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: webhook-worker }
+  policyTypes: [Egress]   # nothing connects to workers except metrics scraping (below)
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: database }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 4318 }
+---
+# Workers deliver to customer endpoints on the public internet. The application
+# already refuses private destinations at connect time (internal/ssrf); this is
+# a second, independent layer: even a bug there cannot reach cluster-internal
+# services, the node, or cloud metadata, because the network drops it. The
+# excluded ranges include the usual pod and service CIDRs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: worker-internet-egress }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: webhook-worker }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - ::1/128
+              - 64:ff9b::/96
+              - 2002::/16
+              - fc00::/7
+              - fe80::/10
+              - ff00::/8
+---
+# Prometheus scrapes /metrics (port 9090) on the api and worker pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-metrics-scrape }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/part-of: webhook-delivery }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { protocol: TCP, port: 9090 }
+---
+# The migrate Job only needs the database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: migrate }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: webhook-migrate }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: database }
+      ports:
+        - { protocol: TCP, port: 5432 }

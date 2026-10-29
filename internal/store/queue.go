@@ -62,10 +62,10 @@ WITH due AS (
            updated_at = now()
       FROM due
      WHERE d.id = due.id
- RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.max_attempts
+ RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.max_attempts, d.created_at, d.trace_context
 )
 SELECT c.id::text, c.tenant_id::text, c.event_id::text, c.endpoint_id::text, c.attempt_count, c.max_attempts,
-       ev.type, ev.payload, ev.created_at, ep.url, ep.secrets
+       ev.type, ev.payload, ev.created_at, ep.url, ep.secrets, c.created_at, c.trace_context
   FROM claimed c
   JOIN events ev ON ev.id = c.event_id
   JOIN endpoints ep ON ep.id = c.endpoint_id`
@@ -81,8 +81,12 @@ func (s *Store) ClaimDeliveries(ctx context.Context, workerID string, limit, per
 	}
 	claimed, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (ClaimedDelivery, error) {
 		var d ClaimedDelivery
+		var trace *string
 		err := r.Scan(&d.ID, &d.TenantID, &d.EventID, &d.EndpointID, &d.Attempt, &d.MaxAttempts,
-			&d.EventType, &d.Payload, &d.EventCreatedAt, &d.URL, &d.Secrets)
+			&d.EventType, &d.Payload, &d.EventCreatedAt, &d.URL, &d.Secrets, &d.CreatedAt, &trace)
+		if trace != nil {
+			d.TraceContext = *trace
+		}
 		return d, err
 	})
 	if err != nil {
@@ -274,4 +278,20 @@ func nullStr(v string) any {
 		return nil
 	}
 	return v
+}
+
+// ReleaseWorkerLeases hands every delivery still leased to workerID straight
+// back to the queue, undoing the attempt it had started (the attempt counter is
+// decremented, no attempt row is written). A worker calls it when it is
+// shutting down and could not finish its in-flight work in time, so that work
+// is retried immediately by another worker instead of waiting for the lease to
+// expire. The request may already have reached the receiver, so, as always,
+// delivery is at-least-once.
+func (s *Store) ReleaseWorkerLeases(ctx context.Context, workerID string) (int, error) {
+	tag, err := s.Pool.Exec(ctx,
+		`UPDATE deliveries
+		    SET status = 'pending', attempt_count = GREATEST(attempt_count - 1, 0),
+		        next_attempt_at = now(), lease_expires_at = NULL, locked_by = NULL, updated_at = now()
+		  WHERE locked_by = $1 AND status = 'in_flight'`, workerID)
+	return int(tag.RowsAffected()), err
 }

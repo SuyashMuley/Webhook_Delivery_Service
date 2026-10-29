@@ -84,6 +84,15 @@ sequenceDiagram
 
 Nothing is acknowledged before commit. If Postgres is down the API returns 503 and the producer retries safely using the idempotency key.
 
+### 5.1a Waking idle workers
+
+Workers poll, but an idle worker sleeping on a poll interval would add up to that interval to every delivery's latency (measured: p99 of ~600 ms at 2,000 deliveries/s with a 500 ms poll). So the API announces new work and idle workers `LISTEN`:
+
+- After an ingest transaction **commits**, the API calls `Notifier.Notify()`. One goroutine per API process turns those calls into at most one `pg_notify` per 10 ms, issued in its own tiny read-only transaction.
+- Workers hold one dedicated `LISTEN` connection that reconnects with backoff, and run a catch-up poll after each (re)connect. Polling remains as the fallback, so a lost notification costs latency, never correctness.
+- **`NOTIFY` is deliberately not issued inside the ingest transaction.** Postgres serializes the commit of every transaction that has issued a `NOTIFY` behind a database-wide lock held through the WAL flush; the load test showed this capping ingest at ~600 events/s (one fsync at a time). Moving it out raised the ceiling to at least 1,600 events/s.
+- `LISTEN` needs a session-level connection, so behind a transaction-pooling proxy (PgBouncer transaction mode) set `WORKER_LISTEN=false` and workers poll.
+
 ### 5.2 Delivery attempt
 
 ```mermaid
@@ -126,9 +135,11 @@ stateDiagram-v2
 
 ### 5.4 Failure recovery
 
+These behaviours are exercised by `cmd/loadtest` against real processes (see `docs/performance.md`).
+
 - **Worker crash**: lease expires; reaper returns the row to `pending`. The request may already have reached the receiver, hence *at-least-once* (receivers dedupe on `webhook-id`).
 - **Worker shutdown**: stop claiming, drain in-flight within a deadline, release remaining leases.
-- **Postgres outage**: API returns 503; workers back off; no data loss.
+- **Postgres outage or partition**: every API request has a deadline (`API_REQUEST_TIMEOUT`, 5s), so producers get a prompt `503` with `Retry-After` instead of hanging for the length of the outage, and retry with their `Idempotency-Key`. Workers' claims fail and retry; their in-flight deliveries finish or lose their lease and are reclaimed. Services wait up to 60s for the database at startup rather than crash-looping. No data loss: nothing is acknowledged before commit.
 - **Dead endpoint**: a 410 pauses the endpoint immediately. Circuit breaker and auto-disable for endpoints that merely fail arrive in Phase 3.
 
 ## 6. Isolation and Fairness
@@ -164,27 +175,49 @@ Every tenant-facing store method runs in a transaction that first sets `app.tena
 
 ## 8. Observability
 
-- **Metrics** (Prometheus): `deliveries_total{status}`, `attempt_duration_seconds`, `queue_depth`, `oldest_pending_age_seconds` (primary SLO signal), `dlq_depth`, `inflight`, `circuit_open_endpoints`, `lease_reclaims_total`. Tenant label limited to top-N plus `other`.
-- **Tracing** (OTel): ingest → delivery attempt linked via trace context stored on the delivery row.
-- **Logging**: structured JSON with `tenant_id`, `event_id`, `delivery_id`, `endpoint_id`, `attempt`.
-- **Alerts**: oldest pending > 5 min, DLQ growth rate, reaper reclaim spike, error-budget burn on delivery success rate.
+**Metrics** (Prometheus, served on a separate `METRICS_ADDR` port, default 9090, so the public ingress never exposes them). Labels are small fixed sets; there is deliberately **no per-tenant or per-endpoint label**, because those grow with customers (tenant-level detail lives in logs and traces).
+
+| Metric | Meaning |
+|---|---|
+| `webhook_oldest_pending_age_seconds` | **The primary latency SLO signal**: age of the oldest delivery a worker could claim right now. Excludes work held for paused endpoints and open circuits, and work waiting behind a customer's own concurrency or in-flight cap, so a slow customer endpoint does not look like a slow platform. |
+| `webhook_queue_depth{state=due\|scheduled\|in_flight}`, `webhook_dlq_depth{reason}`, `webhook_endpoints{state=circuit_open\|paused\|disabled}` | Queue and endpoint state, sampled from Postgres by every worker (aggregate with `max()`) |
+| `webhook_deliveries_total{outcome}` | `succeeded`, `retry`, `dead_max_attempts`, `dead_endpoint_gone`, `released` (handed back at shutdown), `lease_lost` |
+| `webhook_attempt_duration_seconds{result}` | Receiver response time by class: success, http_4xx/5xx/429, network_error, local_error |
+| `webhook_first_attempt_delay_seconds` | Enqueue to first attempt. Includes time behind a slow endpoint's own cap, so read p50/p95 for platform health |
+| `webhook_inflight_deliveries`, `webhook_claim_batch_size`, `webhook_claim_errors_total`, `webhook_lease_reclaims_total{result}`, `webhook_purged_rows_total{table}` | Worker internals |
+| `webhook_http_requests_total{method,route,code}`, `webhook_http_request_duration_seconds{method,route}` | API, keyed by the matched route **pattern** (never the raw path) |
+| `webhook_events_ingested_total{result}`, `webhook_ingest_rejected_total{reason}`, `webhook_quota_check_errors_total` | Ingest and quotas |
+
+**Tracing** (OpenTelemetry, OTLP/HTTP). A trace starts at the producer's request (an incoming W3C `traceparent` is honored). The API's ingest span stores its trace context on every delivery row (`deliveries.trace_context`), and the worker resumes it for each attempt, so one trace shows request, enqueue and every attempt across processes and across hours. Without an exporter configured spans still get real IDs, so logs correlate and context is stored. Sampling is `OTEL_TRACES_SAMPLER_ARG` (1.0 in dev, 0.1 in prod by default).
+
+**Logging**: structured JSON; the API writes one access-log line per request (`request_id`, `route`, `status`, `duration_ms`, `tenant_id`, `trace_id`); worker lines carry `tenant_id`, `event_id`, `delivery_id`, `endpoint_id`, `attempt`, `trace_id`. `X-Request-Id` is generated or echoed on every response.
+
+**Dashboards and alerts** (`deploy/`, provisioned in Compose by `make up-obs`): a Grafana dashboard and `deploy/prometheus/alerts.yml`, whose rules are unit-tested with `promtool` (`make test-alerts`). Alerts: oldest pending age > 5 min (warning) / > 15 min (critical); multi-window multi-burn-rate error-budget burn for a 99% delivery-success SLO (success vs `dead_max_attempts`; retries and 410s do not count); DLQ growth; lease-reclaim spike (workers crashing); many open circuits; claim errors; stale queue sampling; no workers; API down, 5xx rate, ingest p99, throttling, and quota checks failing open.
+
+**Operations**
+- **Quotas**: per-tenant ingest rate is a token bucket in Postgres shared by every API replica. Replicas lease ~100ms worth of tokens at a time, so the database sees a few writes per tenant per second regardless of traffic (at the price of a little slack: unused leased tokens are forfeited and a tenant can briefly exceed its rate by about one lease per replica). `max_pending` bounds a tenant's undelivered backlog, checked against a count cached for 2s. Both return 429 with `Retry-After`, and both **fail open** if the database cannot answer (counted in `webhook_quota_check_errors_total`).
+- **Retention**: workers delete succeeded deliveries (default 7d), dead-lettered ones (30d) and events with no remaining deliveries (7d) in bounded `SKIP LOCKED` batches, using dedicated partial indexes. An `Idempotency-Key` is forgotten when its event is purged.
+- **Graceful shutdown**: on SIGTERM readiness fails first (`SHUTDOWN_DRAIN_DELAY`) so load balancers stop routing; the API finishes in-flight requests; a worker stops claiming, waits `WORKER_DRAIN_TIMEOUT` for in-flight deliveries, then aborts the rest and hands their leases straight back (attempt refunded, no attempt recorded), so another worker retries immediately instead of after the lease expires.
 
 ## 9. Deployment Topology
 
 ```mermaid
 flowchart TB
-    LB[Load balancer / Ingress] --> API1[api pod] & API2[api pod]
-    subgraph K8s
+    ING[Ingress controller] --> API1[api pod] & API2[api pod]
+    subgraph K8s["Kubernetes (namespace: webhooks, restricted PSS)"]
         API1 & API2
         W1[worker pod] & W2[worker pod] & W3[worker pod]
-        HPA[HPA: oldest_pending_age, CPU]
+        HPA["HPA: due deliveries per worker,<br/>oldest pending age, CPU"]
     end
-    API1 & API2 & W1 & W2 & W3 --> PGP[(Postgres primary)]
+    API1 & API2 -- "webhooks_api login" --> PGP[(Postgres primary)]
+    W1 & W2 & W3 -- "webhooks_worker login" --> PGP
     PGP --> PGR[(Read replica: DLQ/history queries)]
-    W1 & W2 & W3 -- egress via NetworkPolicy --> NET[Internet]
+    W1 & W2 & W3 -- "egress: public IPs only (NetworkPolicy)" --> NET[Customer endpoints]
+    PROM[Prometheus] -. scrapes :9090 .-> API1 & W1
+    API1 & W1 -. OTLP .-> TRACES[Trace collector]
 ```
 
-Local development: Docker Compose with Postgres, api, worker, a configurable flaky mock receiver, Prometheus, and Grafana.
+Manifests are in `deploy/k8s` (kustomize base, schema-validated in CI): hardened Deployments, PodDisruptionBudgets, HPAs, default-deny NetworkPolicies, a migration Job. The API and worker use separate database logins that hold only their own restricted role. Local development: Docker Compose, with `make up-obs` adding Prometheus, Grafana (dashboard preloaded) and Jaeger.
 
 ## 10. Scalability Path
 

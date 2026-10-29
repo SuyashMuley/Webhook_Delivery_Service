@@ -1,0 +1,23 @@
+# Exposes the queue metrics to the HPA as External metrics (see ../hpa.yaml).
+# prometheus-adapter reads its rules from a ConfigMap; merge the `rules.external`
+# entries below into the one your adapter uses (or mount this as an extra
+# config, depending on how the adapter is installed).
+#
+# Every worker publishes the same queue state, so max() (not sum()) is the
+# right aggregation.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-webhook-rules
+  namespace: monitoring
+data:
+  config.yaml: |
+    externalRules:
+      - seriesQuery: 'webhook_queue_depth{state="due"}'
+        metricsQuery: 'max(webhook_queue_depth{state="due"})'
+        name: { as: "webhook_queue_due_deliveries" }
+        resources: { namespaced: false }
+      - seriesQuery: 'webhook_oldest_pending_age_seconds'
+        metricsQuery: 'max(webhook_oldest_pending_age_seconds)'
+        name: { as: "webhook_oldest_pending_age_seconds" }
+        resources: { namespaced: false }

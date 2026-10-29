@@ -3,8 +3,12 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
+
+	"webhookdelivery/internal/ratelimit"
 )
 
 const (
@@ -41,14 +45,35 @@ func (a *API) createEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Quotas are checked after validation so malformed requests do not spend tokens.
+	if q := a.opts.Quota; q != nil {
+		if d := q.Allow(r.Context(), tenantID(r)); !d.Allowed {
+			secs := int(math.Ceil(d.RetryAfter.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
+			msg := "too many events; retry after the delay in Retry-After"
+			if d.Reason == ratelimit.ReasonBacklogFull {
+				msg = "too many undelivered events are queued for this tenant; retry later"
+			}
+			a.writeError(w, http.StatusTooManyRequests, d.Reason, msg)
+			return
+		}
+	}
+
 	res, err := a.store.IngestEvent(r.Context(), tenantID(r), req.Type, req.Payload, idem, a.opts.MaxAttempts)
 	if err != nil {
 		a.internalError(w, r, err)
 		return
 	}
+	if res.Deliveries > 0 && !res.Duplicate && a.opts.Wake != nil {
+		a.opts.Wake() // after commit, so a woken worker is guaranteed to find the rows
+	}
 	status := http.StatusAccepted
+	result := "accepted"
 	if res.Duplicate {
-		status = http.StatusOK
+		status, result = http.StatusOK, "duplicate"
+	}
+	if m := a.opts.Metrics; m != nil {
+		m.EventsIngested.WithLabelValues(result).Inc()
 	}
 	writeJSON(w, status, map[string]any{
 		"id":         res.EventID,

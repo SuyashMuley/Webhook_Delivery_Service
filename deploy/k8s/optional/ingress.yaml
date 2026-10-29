@@ -1,0 +1,23 @@
+# Example public entry point for event producers; adapt the class, host and TLS secret.
+# Only the API is exposed, and only its public port: /metrics lives on a separate port
+# and is not routed here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webhook-api
+  namespace: webhooks
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "512k"   # events are capped at 256KB
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [hooks.example.com]
+      secretName: webhook-api-tls
+  rules:
+    - host: hooks.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service: { name: webhook-api, port: { name: http } }

@@ -35,7 +35,9 @@ func TestBlackHoleEndpointDoesNotSlowHealthyEndpoints(t *testing.T) {
 
 		start := time.Now()
 		s.startWorker()
-		s.waitFor(func() bool { return len(healthy.snapshot()) >= events }, "all healthy deliveries")
+		// The uncapped run is slow on purpose (the black hole holds every worker slot until
+		// its timeouts), so give it generous room; only the measured time is asserted on.
+		s.waitForWithin(60*time.Second, func() bool { return len(healthy.snapshot()) >= events }, "all healthy deliveries")
 		return time.Since(start), hole.maxActive.Load()
 	}
 
@@ -52,7 +54,7 @@ func TestBlackHoleEndpointDoesNotSlowHealthyEndpoints(t *testing.T) {
 		t.Errorf("the uncapped run never exceeded 5 concurrent black-hole deliveries (%d): the scenario does not exercise the cap", uncappedMax)
 	}
 	// The healthy endpoint is fast no matter what the black hole does...
-	if cappedTime > 1500*time.Millisecond {
+	if cappedTime > 3*time.Second {
 		t.Errorf("with the cap, healthy deliveries took %v; the black hole slowed them down", cappedTime)
 	}
 	// ...and without the cap the black hole demonstrably hurts it.

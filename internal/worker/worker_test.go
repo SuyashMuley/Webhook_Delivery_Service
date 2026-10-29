@@ -15,7 +15,9 @@ import (
 
 	"webhookdelivery/internal/api"
 	"webhookdelivery/internal/deliver"
+	"webhookdelivery/internal/metrics"
 	"webhookdelivery/internal/retry"
+	"webhookdelivery/internal/server"
 	"webhookdelivery/internal/sign"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/internal/testutil"
@@ -43,10 +45,13 @@ type receiver struct {
 	// hung upstream. active/maxActive count how many requests were in flight.
 	blackHole bool
 	release   chan struct{}
+	relOnce   sync.Once
+	delay     time.Duration // normal mode: answer only after this long
 	active    atomic.Int32
 	maxActive atomic.Int32
 
 	mu     sync.Mutex
+	acked  map[string]int // event id -> times answered with a 2xx (what the endpoint really accepted)
 	hits   []hit
 	behave func(n int) response
 	secret []byte
@@ -65,12 +70,15 @@ func newBlackHole(t *testing.T) *receiver {
 	r := newReceiver(t, ok())
 	r.blackHole = true
 	r.release = make(chan struct{})
-	t.Cleanup(func() { close(r.release) }) // runs before the server's Close, which waits for handlers
+	t.Cleanup(r.open) // runs before the server's Close, which waits for handlers
 	return r
 }
 
+// open lets a black hole answer from now on (a hung upstream coming back to life).
+func (r *receiver) open() { r.relOnce.Do(func() { close(r.release) }) }
+
 func newReceiver(t *testing.T, behave func(n int) response) *receiver {
-	r := &receiver{behave: behave}
+	r := &receiver{behave: behave, acked: map[string]int{}}
 	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if r.blackHole {
 			// Read the body first: only then does Go watch the connection, so the
@@ -87,11 +95,19 @@ func newReceiver(t *testing.T, behave func(n int) response) *receiver {
 			}
 			select {
 			case <-req.Context().Done():
+				return
 			case <-r.release:
 			}
-			return
+			// opened: fall through and answer like a healthy receiver
 		}
 		body, _ := io.ReadAll(req.Body)
+		if r.delay > 0 {
+			select {
+			case <-time.After(r.delay):
+			case <-req.Context().Done():
+				return
+			}
+		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		err := sign.Verify(req.Header.Get("webhook-signature"), [][]byte{r.secret}, req.Header.Get("webhook-id"),
@@ -100,6 +116,9 @@ func newReceiver(t *testing.T, behave func(n int) response) *receiver {
 			timestamp: req.Header.Get("webhook-timestamp"), signature: req.Header.Get("webhook-signature"),
 			body: body, verifyErr: err})
 		resp := r.behave(len(r.hits))
+		if resp.status >= 200 && resp.status < 300 {
+			r.acked[req.Header.Get("webhook-id")]++
+		}
 		for k, v := range resp.headers {
 			w.Header().Set(k, v)
 		}
@@ -121,6 +140,13 @@ func (r *receiver) setBehavior(f func(n int) response) {
 	r.behave = f
 }
 
+// ackCount is how many times the endpoint accepted (2xx) the event.
+func (r *receiver) ackCount(event string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.acked[event]
+}
+
 func (r *receiver) snapshot() []hit {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -134,6 +160,9 @@ type opts struct {
 	breaker     store.BreakerPolicy
 	concurrency int
 	sendTimeout time.Duration
+	metrics     *metrics.Metrics
+	drain       time.Duration // worker DrainTimeout
+	instrument  bool          // wrap the API in server.Instrument (spans, request ids)
 }
 
 type system struct {
@@ -163,36 +192,62 @@ func newSystem(t *testing.T, o opts) *system {
 	if o.concurrency == 0 {
 		o.concurrency = 10
 	}
+	if o.metrics == nil {
+		o.metrics = metrics.New()
+	}
 	if o.sendTimeout == 0 {
 		o.sendTimeout = 5 * time.Second
 	}
 	st := testutil.NewStore(t)
 	_, key := testutil.NewTenant(t, st, "acme")
 
+	apiStore := testutil.WithRole(t, st, store.RoleAPI)
+	notifier := apiStore.NewNotifier(5 * time.Millisecond)
+	nctx, stopNotifier := context.WithCancel(context.Background())
+	go notifier.Run(nctx)
+	t.Cleanup(stopNotifier)
 	mux := http.NewServeMux()
-	api.New(testutil.WithRole(t, st, store.RoleAPI), discard(), api.Options{AllowInsecureURLs: true, MaxAttempts: o.maxAttempts}).Register(mux)
-	srv := httptest.NewServer(mux)
+	api.New(apiStore, discard(), api.Options{AllowInsecureURLs: true, MaxAttempts: o.maxAttempts, Wake: notifier.Notify}).Register(mux)
+	var h http.Handler = mux
+	if o.instrument {
+		h = server.Instrument(discard(), nil, mux)
+	}
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return &system{t: t, st: st, api: srv, key: key, o: o}
 }
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func (s *system) startWorker() {
+func (s *system) startWorker() func() { return s.startWorkerAs("test-worker", nil) }
+
+// startWorkerAs runs a worker (its main loop and reaper) under the given id and
+// returns a function that stops it and waits for it to finish, like a SIGTERM
+// followed by exit. mod may adjust the worker's configuration.
+func (s *system) startWorkerAs(id string, mod func(*worker.Config)) (stop func()) {
 	s.t.Helper()
 	ws := testutil.WithRole(s.t, s.st, store.RoleWorker)
 	ws.Breaker = s.o.breaker
-	w := worker.New(ws, deliver.NewSender(s.o.sendTimeout, true), discard(), worker.Config{
-		ID: "test-worker", BatchSize: 10, TenantSlice: 10, Concurrency: s.o.concurrency,
+	cfg := worker.Config{
+		ID: id, BatchSize: 10, TenantSlice: 10, Concurrency: s.o.concurrency,
 		PollInterval: 20 * time.Millisecond, Lease: s.o.lease, ReaperInterval: 50 * time.Millisecond,
-		Retry: retry.Policy{Schedule: s.o.schedule, MaxRetryAfter: time.Hour},
-	})
+		Retry:        retry.Policy{Schedule: s.o.schedule, MaxRetryAfter: time.Hour},
+		Metrics:      s.o.metrics,
+		DrainTimeout: s.o.drain,
+	}
+	if mod != nil {
+		mod(&cfg)
+	}
+	w := worker.New(ws, deliver.NewSender(s.o.sendTimeout, true), discard(), cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); _ = w.Run(ctx) }()
 	go func() { defer wg.Done(); _ = w.RunReaper(ctx) }()
-	s.t.Cleanup(func() { cancel(); wg.Wait() })
+	var once sync.Once
+	stop = func() { once.Do(func() { cancel(); wg.Wait() }) }
+	s.t.Cleanup(stop)
+	return stop
 }
 
 func (s *system) call(method, path string, body any) map[string]any {
@@ -237,7 +292,12 @@ func (s *system) event(typ string) map[string]any {
 
 func (s *system) waitFor(cond func() bool, what string) {
 	s.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	s.waitForWithin(10*time.Second, cond, what)
+}
+
+func (s *system) waitForWithin(limit time.Duration, cond func() bool, what string) {
+	s.t.Helper()
+	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

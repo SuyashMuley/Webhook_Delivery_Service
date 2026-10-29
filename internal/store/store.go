@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,6 +66,34 @@ func Connect(ctx context.Context, databaseURL string, opts ...Option) (*Store, e
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 	return &Store{Pool: pool, Breaker: DefaultBreaker()}, nil
+}
+
+// ConnectWithRetry is Connect, but keeps trying for up to wait if the database
+// is unreachable. Services use it at startup so that a brief outage (a failover,
+// a partition, a restart of the database) delays them instead of crashing them.
+// A configuration error (an unparseable URL) fails immediately.
+func ConnectWithRetry(ctx context.Context, databaseURL string, wait time.Duration, opts ...Option) (*Store, error) {
+	if _, err := pgxpool.ParseConfig(databaseURL); err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	deadline := time.Now().Add(wait)
+	backoff := 250 * time.Millisecond
+	for {
+		s, err := Connect(ctx, databaseURL, opts...)
+		if err == nil {
+			return s, nil
+		}
+		remaining := time.Until(deadline)
+		if ctx.Err() != nil || remaining <= 0 {
+			return nil, err
+		}
+		select { // wait, but never past the deadline: make a last attempt right at it
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(min(backoff, remaining)):
+		}
+		backoff = min(backoff*2, 2*time.Second)
+	}
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.Pool.Ping(ctx) }

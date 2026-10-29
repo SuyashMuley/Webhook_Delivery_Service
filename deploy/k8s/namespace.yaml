@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webhooks
+  labels:
+    # Enforce the restricted Pod Security Standard: non-root, no privilege escalation, dropped capabilities, seccomp.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

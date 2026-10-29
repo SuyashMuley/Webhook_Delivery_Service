@@ -1,0 +1,13 @@
+# For clusters running the Prometheus Operator (needs its CRDs).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: webhook-delivery
+  namespace: webhooks
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/part-of: webhook-delivery }
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s

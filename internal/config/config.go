@@ -24,7 +24,8 @@ type Config struct {
 	// Worker settings.
 	WorkerBatchSize   int           // max deliveries claimed per poll
 	WorkerConcurrency int           // max deliveries in flight per worker
-	PollInterval      time.Duration // sleep when the queue is empty
+	PollInterval      time.Duration // sleep when the queue is empty (fallback when WorkerListen is off)
+	WorkerListen      bool          // wake idle workers via Postgres LISTEN/NOTIFY when events arrive
 	DeliveryTimeout   time.Duration // total time allowed for one HTTP delivery
 	LeaseDuration     time.Duration // how long a claim is held before it can be reclaimed
 	TenantSlice       int           // max deliveries taken from one tenant per claim (fairness)
@@ -40,6 +41,22 @@ type Config struct {
 	BreakerBaseOpen  time.Duration // first open window; doubles each re-open
 	BreakerMaxOpen   time.Duration
 	AutoDisableAfter time.Duration // continuous failure time after which an endpoint is disabled (0 = never)
+
+	APIRequestTimeout time.Duration // deadline for one API request, database calls included
+
+	// Operations.
+	MetricsAddr        string        // listen address of the Prometheus /metrics server ("" disables it)
+	OTLPEndpoint       string        // OTLP/HTTP trace collector, e.g. http://jaeger:4318 ("" = no export)
+	TraceSampleRatio   float64       // fraction of new traces sampled (0..1)
+	DrainDelay         time.Duration // how long readiness fails before the listener closes on shutdown
+	WorkerDrainTimeout time.Duration // how long a worker waits for in-flight deliveries on shutdown
+	StatsInterval      time.Duration // how often queue state is sampled for metrics
+
+	// Retention (0 disables a category; PURGE_INTERVAL=0 disables the job).
+	PurgeInterval   time.Duration
+	RetainSucceeded time.Duration
+	RetainDead      time.Duration
+	RetainEvents    time.Duration
 
 	// Security.
 	AllowPrivateTargets bool   // permit http:// endpoint URLs and private/loopback destinations (dev only)
@@ -91,12 +108,26 @@ func load(get func(string) string, defaultHTTPAddr, defaultDBRole string) (Confi
 		BreakerMaxOpen:   duration(get, "BREAKER_MAX_OPEN", "1h", &errs),
 		AutoDisableAfter: duration(get, "AUTO_DISABLE_AFTER", "72h", &errs),
 
+		MetricsAddr:        or(get("METRICS_ADDR"), ":9090"),
+		OTLPEndpoint:       strings.TrimRight(strings.TrimSpace(get("OTEL_EXPORTER_OTLP_ENDPOINT")), "/"),
+		DrainDelay:         duration(get, "SHUTDOWN_DRAIN_DELAY", "3s", &errs),
+		WorkerDrainTimeout: duration(get, "WORKER_DRAIN_TIMEOUT", "20s", &errs),
+		StatsInterval:      duration(get, "STATS_INTERVAL", "15s", &errs),
+		APIRequestTimeout:  duration(get, "API_REQUEST_TIMEOUT", "5s", &errs),
+
+		PurgeInterval:   duration(get, "PURGE_INTERVAL", "5m", &errs),
+		RetainSucceeded: duration(get, "RETAIN_SUCCEEDED", "168h", &errs),
+		RetainDead:      duration(get, "RETAIN_DEAD", "720h", &errs),
+		RetainEvents:    duration(get, "RETAIN_EVENTS", "168h", &errs),
+
 		SecretKeys: strings.TrimSpace(get("SECRET_ENCRYPTION_KEYS")),
 		DBRole:     or(get("DB_ROLE"), defaultDBRole),
 	}
 	if c.DBRole == "none" {
 		c.DBRole = ""
 	}
+	c.TraceSampleRatio = ratio(get, "OTEL_TRACES_SAMPLER_ARG", map[bool]float64{true: 1, false: 0.1}[c.Env == "dev"], &errs)
+	c.WorkerListen = boolean(get, "WORKER_LISTEN", true, &errs)
 	c.AllowPrivateTargets = boolean(get, "ALLOW_PRIVATE_TARGETS", c.Env == "dev", &errs)
 	if c.LogFormat == "" {
 		c.LogFormat = "text"
@@ -164,6 +195,20 @@ func schedule(get func(string) string, key string, def []time.Duration, errs *[]
 		out = append(out, d)
 	}
 	return out
+}
+
+// ratio parses a fraction in [0, 1].
+func ratio(get func(string) string, key string, def float64, errs *[]error) float64 {
+	v := strings.TrimSpace(get(key))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || f > 1 {
+		*errs = append(*errs, fmt.Errorf("%s must be a number between 0 and 1, got %q", key, v))
+		return def
+	}
+	return f
 }
 
 func boolean(get func(string) string, key string, def bool, errs *[]error) bool {

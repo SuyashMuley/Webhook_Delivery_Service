@@ -6,6 +6,8 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+
+	"webhookdelivery/internal/telemetry"
 )
 
 // IngestEvent stores an event and fans it out to every active endpoint of the
@@ -14,6 +16,12 @@ import (
 // event is returned with Duplicate = true. Each delivery may be attempted at
 // most maxAttempts times before it is sent to the DLQ.
 func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, payload json.RawMessage, idemKey string, maxAttempts int) (IngestResult, error) {
+	// The ingest span's context is stored on every delivery so the worker can
+	// continue this trace when it sends them, possibly much later.
+	ctx, span := telemetry.Tracer().Start(ctx, "store.ingest_event")
+	defer span.End()
+	traceparent := telemetry.Inject(ctx)
+
 	var res IngestResult
 	err := s.inTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var key *string
@@ -42,12 +50,15 @@ func (s *Store) IngestEvent(ctx context.Context, tenantID, eventType string, pay
 		}
 
 		tag, err := tx.Exec(ctx,
-			`INSERT INTO deliveries (tenant_id, event_id, endpoint_id, max_attempts)
-			 SELECT $1::uuid, $2::uuid, id, $4::int FROM endpoints
+			`INSERT INTO deliveries (tenant_id, event_id, endpoint_id, max_attempts, trace_context)
+			 SELECT $1::uuid, $2::uuid, id, $4::int, NULLIF($5::text, '') FROM endpoints
 			  WHERE tenant_id = $1::uuid AND status = 'active'
 			    AND ('*' = ANY(event_types) OR $3 = ANY(event_types))`,
-			tenantID, res.EventID, eventType, maxAttempts)
+			tenantID, res.EventID, eventType, maxAttempts, traceparent)
 		res.Deliveries = int(tag.RowsAffected())
+		// Deliberately no NOTIFY here: a transaction that issues one takes a
+		// database-wide lock for the duration of its commit (including the WAL
+		// flush), which serializes every ingest commit. See Notifier.
 		return err
 	})
 	return res, err

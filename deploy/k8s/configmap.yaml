@@ -1,0 +1,23 @@
+# Non-secret settings shared by the api and worker. Secrets (database URLs and
+# encryption keys) come from Secrets, see secret.example.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-config
+data:
+  APP_ENV: "prod"                      # https-only endpoints, no private targets, JSON logs, requires encryption keys
+  LOG_LEVEL: "info"
+  METRICS_ADDR: ":9090"
+  MAX_ATTEMPTS: "8"
+  # Shutdown: readiness fails for SHUTDOWN_DRAIN_DELAY, then in-flight work gets
+  # WORKER_DRAIN_TIMEOUT. terminationGracePeriodSeconds (45s) must exceed both plus a margin.
+  SHUTDOWN_DRAIN_DELAY: "3s"
+  WORKER_DRAIN_TIMEOUT: "20s"
+  # Point at your OTLP/HTTP collector to export traces; empty disables export.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+  # Retention
+  PURGE_INTERVAL: "5m"
+  RETAIN_SUCCEEDED: "168h"
+  RETAIN_DEAD: "720h"
+  RETAIN_EVENTS: "168h"

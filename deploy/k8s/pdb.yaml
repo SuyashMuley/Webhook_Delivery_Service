@@ -1,0 +1,15 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: webhook-api }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: webhook-api }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: webhook-worker }
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: webhook-worker }

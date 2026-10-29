@@ -6,6 +6,8 @@
 //	admin create-key <tenant-id>      prints a new API key (shown once)
 //	admin revoke-key <key-prefix>     revokes the key with that prefix (e.g. whk_1a2b3c4d)
 //	admin gen-secret-key <key-id>     prints a new key-encryption key for SECRET_ENCRYPTION_KEYS
+//	admin set-limits <tenant-id> <events-per-sec> <max-pending> <max-inflight>
+//	                                  tenant quotas: ingest rate, undelivered backlog, concurrent deliveries
 //	admin encrypt-secrets             encrypts legacy plaintext secrets and re-seals secrets
 //	                                  under the active key (run after a key rotation)
 //
@@ -18,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"webhookdelivery/internal/auth"
 	"webhookdelivery/internal/config"
@@ -32,7 +35,7 @@ func main() {
 	}
 }
 
-var errUsage = errors.New("usage: admin create-tenant <name> | create-key <tenant-id> | revoke-key <key-prefix> | gen-secret-key <key-id> | encrypt-secrets")
+var errUsage = errors.New("usage: admin create-tenant <name> | create-key <tenant-id> | revoke-key <key-prefix> | gen-secret-key <key-id> | set-limits <tenant-id> <events/s> <max-pending> <max-inflight> | encrypt-secrets")
 
 func run(args []string) error {
 	if len(args) == 0 {
@@ -89,6 +92,19 @@ func run(args []string) error {
 			return errUsage
 		}
 		return db.RevokeAPIKey(ctx, args[1])
+	case "set-limits":
+		if len(args) != 5 {
+			return errUsage
+		}
+		var n [3]int
+		for i := range n {
+			v, err := strconv.Atoi(args[2+i])
+			if err != nil || v < 1 {
+				return fmt.Errorf("limits must be positive integers, got %q", args[2+i])
+			}
+			n[i] = v
+		}
+		return db.SetTenantLimits(ctx, args[1], n[0], n[1], n[2])
 	case "encrypt-secrets":
 		// Reuse the services' own key configuration. DATABASE_URL is already
 		// set; the other required settings are not needed here.

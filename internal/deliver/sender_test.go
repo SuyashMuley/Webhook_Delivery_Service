@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,5 +157,50 @@ func TestProductionSenderRefusesInternalAndInsecureTargets(t *testing.T) {
 	req, _ = testRequest(strings.Replace(tlsSrv.URL, "127.0.0.1", "localhost", 1))
 	if res := prod.Send(context.Background(), req); !errors.As(res.Err, &blocked) {
 		t.Errorf("hostname resolving to loopback: got %+v, want BlockedError", res)
+	}
+}
+
+// Many concurrent deliveries to one host must share connections. Opening a new
+// TCP (and TLS) connection per delivery exhausts ephemeral ports under load and
+// pays a handshake each time; found by the load test, which saw
+// "can't assign requested address" at ~1,000 deliveries/s.
+func TestConcurrentDeliveriesToOneHostReuseConnections(t *testing.T) {
+	var conns atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(5 * time.Millisecond) // keep requests overlapping, like real receivers
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	sender := NewSender(5*time.Second, true)
+	const workers, perWorker = 40, 25 // 1,000 deliveries, 40 at a time
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range perWorker {
+				req, _ := testRequest(srv.URL)
+				if !sender.Send(context.Background(), req).Success() {
+					failed.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if failed.Load() != 0 {
+		t.Fatalf("%d deliveries failed", failed.Load())
+	}
+	// With reuse, connections track concurrency (~40). Without it, nearly every one of the 1,000 dials anew.
+	if got := conns.Load(); got > 120 {
+		t.Fatalf("1,000 deliveries at concurrency %d opened %d connections: connections are not being reused", workers, got)
 	}
 }

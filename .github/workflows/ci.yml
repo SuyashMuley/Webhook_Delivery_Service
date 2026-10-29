@@ -51,6 +51,62 @@ jobs:
           go-version-file: go.mod
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
 
+  loadtest-smoke:
+    # A short run of the real load/chaos tool: real processes, real `kill -9`s, and the
+    # database invariants. The full-scale runs (2,000 deliveries/s, outages) are manual:
+    # see docs/performance.md.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: webhooks
+          POSTGRES_PASSWORD: webhooks
+          POSTGRES_DB: webhooks
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U webhooks"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://webhooks:webhooks@localhost:5432/webhooks?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make bin
+      - name: Steady load
+        run: ./bin/loadtest -scenario none -rate 100 -fanout 5 -tenants 10 -duration 15s
+      - name: Worker crashes and receiver faults
+        run: |
+          ./bin/loadtest -scenario kill-workers -rate 100 -fanout 5 -tenants 10 -duration 30s
+          ./bin/loadtest -scenario receiver-faults -rate 100 -fanout 5 -tenants 10 -duration 30s
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: loadtest-out
+          path: loadtest-out/
+
+  ops:
+    # Everything operators depend on but the Go tests do not exercise.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Alert rules are valid and behave as specified
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:latest check rules alerts.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:latest test rules alerts_test.yml
+      - name: Kubernetes manifests render and pass schema validation
+        run: |
+          kubectl kustomize deploy/k8s | docker run --rm -i ghcr.io/yannh/kubeconform:latest -strict -summary -kubernetes-version 1.30.0 -
+          docker run --rm -v "$PWD/deploy/k8s/optional:/o" ghcr.io/yannh/kubeconform:latest -strict -summary -kubernetes-version 1.30.0 -ignore-missing-schemas /o
+      - name: Grafana dashboard is valid JSON and the generated PrometheusRule is current
+        run: |
+          python3 -c "import json;json.load(open('deploy/grafana/dashboards/webhook-delivery.json'))"
+          pip install pyyaml
+          make gen-k8s-rules
+          git diff --exit-code deploy/k8s/optional/prometheusrule.yaml
+
   docker:
     runs-on: ubuntu-latest
     strategy:

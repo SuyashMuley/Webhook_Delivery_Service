@@ -1,0 +1,46 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: webhook-api }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: webhook-api }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: 300 }
+---
+# The worker scales on queue state, not just CPU: workers spend most of their time
+# waiting on customer endpoints, so CPU stays low while the queue grows. The two
+# External metrics come from Prometheus through prometheus-adapter; see
+# optional/prometheus-adapter-rules.yaml. The HPA uses whichever metric asks for the
+# most replicas.
+#
+# maxReplicas also bounds database connections: each worker holds a connection pool,
+# so size Postgres (or put PgBouncer in front) for maxReplicas.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: webhook-worker }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: webhook-worker }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: External          # due deliveries per worker replica
+      external:
+        metric: { name: webhook_queue_due_deliveries }
+        target: { type: AverageValue, averageValue: "200" }
+    - type: External          # age of the oldest claimable delivery: scale up before it breaches the 300s alert
+      external:
+        metric: { name: webhook_oldest_pending_age_seconds }
+        target: { type: Value, value: "30" }
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{ type: Pods, value: 4, periodSeconds: 60 }]
+    scaleDown:
+      stabilizationWindowSeconds: 600   # shrink slowly: shutdown hands back in-flight work, but churn is wasteful
+      policies: [{ type: Pods, value: 1, periodSeconds: 120 }]

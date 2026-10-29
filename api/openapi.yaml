@@ -7,6 +7,8 @@ info:
     and unordered; receivers should deduplicate on the `webhook-id` header (the event id).
 servers:
   - url: http://localhost:8080
+# Every response carries an `X-Request-Id` (a caller-supplied one is echoed back) and the service
+# continues an incoming W3C `traceparent`, so a request can be followed through logs and traces.
 security:
   - bearerAuth: []
 components:
@@ -241,6 +243,20 @@ paths:
                 properties: { id: { type: string }, deliveries: { type: integer }, duplicate: { type: boolean } }
         '200': { description: Duplicate Idempotency-Key; the original event is returned }
         '413': { $ref: '#/components/responses/Error' }
+        '503':
+          description: |
+            The service could not reach its database in time (each request has a deadline, default 5s).
+            Retry after the delay in `Retry-After`, with the same `Idempotency-Key`.
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: |
+            Over the tenant's quota: `rate_limited` (events per second) or `backlog_full` (too many undelivered
+            events queued). Retry after the delay in `Retry-After`; an `Idempotency-Key` makes retries safe.
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait before retrying }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
   /v1/events/{id}/deliveries:
     get:
       summary: Delivery status for an event

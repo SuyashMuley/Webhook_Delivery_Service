@@ -2,7 +2,7 @@
 
 Multi-tenant webhook delivery service with retries and a dead letter queue. See [docs/architecture.md](docs/architecture.md) for the design and [docs/plan.md](docs/plan.md) for the build plan.
 
-**Status:** Phases 0-3 complete: events fan out to subscribed endpoints and are delivered signed, with scheduled retries, a dead letter queue with replay, crash recovery, per-endpoint isolation (concurrency caps and a circuit breaker), SSRF protection, encrypted and rotatable secrets, and database-enforced tenant isolation. Next: observability and ops (Phase 4).
+**Status:** Phases 0-5 complete: events fan out to subscribed endpoints and are delivered signed, with scheduled retries, a dead letter queue with replay, crash recovery, per-endpoint isolation (concurrency caps and a circuit breaker), SSRF protection, encrypted and rotatable secrets, and database-enforced tenant isolation. Phase 4 adds metrics, tracing, dashboards and alerts, Kubernetes manifests, tenant quotas, retention and graceful shutdown. Phase 5 adds a load and chaos tool with a database invariant checker (see [docs/performance.md](docs/performance.md)).
 
 ## Run locally
 
@@ -39,6 +39,30 @@ curl -s localhost:8080/v1/deliveries/$ID -H "Authorization: Bearer $KEY"        
 curl -s -X POST localhost:8080/v1/deliveries/$ID/replay -H "Authorization: Bearer $KEY"
 curl -s localhost:8080/v1/dlq/replay -H "Authorization: Bearer $KEY" -d '{"reason":"max_attempts","rate_per_second":5}'
 ```
+
+### Load and chaos testing
+
+```sh
+make loadtest                      # 400 events/s x 5 endpoints = 2,000 deliveries/s for 60s
+make loadtest SCENARIO=mixed       # ...while crashing workers and APIs, partitioning and crashing Postgres, and abusing the receiver
+./bin/loadtest -h                  # rate, fan-out, tenants, process counts, durations
+```
+
+`cmd/loadtest` creates a throwaway database, runs real `api` and `worker` processes (so `kill -9` is a genuine crash), sends events at a fixed arrival rate, and afterwards checks the database invariants: every accepted event exists with one delivery per endpoint, every delivery is `succeeded` or `dead` (none stuck), nothing marked succeeded was lost, and no lease is left behind. Scenarios: `none`, `kill-workers`, `kill-api`, `db-restart`, `db-partition`, `receiver-faults`, `mixed`. Results, methodology and the bugs this found are in [docs/performance.md](docs/performance.md). A short version runs in CI; `TestInvariantsHoldUnderFailuresAndCrashes` is the in-process equivalent that runs with `go test`.
+
+### Observability, quotas and operations
+
+```sh
+make up-obs      # everything plus Prometheus :9090, Grafana :3000 (dashboard preloaded), Jaeger :16686
+make test-alerts # unit-test the Prometheus alert rules (promtool)
+make validate-k8s
+```
+
+- **Metrics** are served on `:9090` inside each service (a separate port from the API, never exposed by the ingress). **Traces**: set `OTEL_EXPORTER_OTLP_ENDPOINT` (`make up-obs` does). **Logs** carry `request_id`, `tenant_id` and `trace_id`.
+- **Quotas**: each tenant has `events_per_sec` (burst = 2s worth), `max_pending` and `max_inflight`. Over quota, `POST /v1/events` returns `429` with `Retry-After`. Set them with `go run ./cmd/admin set-limits <tenant-id> <events/s> <max-pending> <max-inflight>`.
+- **Retention**: `RETAIN_SUCCEEDED` (7d), `RETAIN_DEAD` (30d), `RETAIN_EVENTS` (7d), `PURGE_INTERVAL` (5m; `0s` disables). An `Idempotency-Key` is forgotten when its event is purged.
+- **Shutdown**: readiness fails for `SHUTDOWN_DRAIN_DELAY` (3s), then workers drain for `WORKER_DRAIN_TIMEOUT` (20s) and hand back unfinished deliveries. Keep Compose/Kubernetes grace periods longer (Compose is set to 45s).
+- Kubernetes: see [deploy/k8s/README.md](deploy/k8s/README.md).
 
 ### Secret rotation, security and isolation
 
@@ -89,9 +113,17 @@ internal/ssrf              blocked-address policy enforced at connect time
 internal/config            env-based configuration
 internal/logging           slog setup
 internal/server            HTTP shell + /healthz, /readyz
-internal/store             Postgres queries (events, endpoints, queue)
+internal/store             Postgres queries (events, endpoints, queue, stats, retention)
+internal/metrics           Prometheus metric definitions
+internal/telemetry         OpenTelemetry setup and trace-context propagation
+internal/ratelimit         per-tenant ingest quotas
+internal/invariants        database invariant checker (used by tests and the load tool)
+internal/loadtest          load generator, fault-injecting receiver, scenarios
+internal/chaosproxy        TCP proxy that simulates network partitions
+cmd/loadtest               load and chaos test driver
 internal/testutil          per-test Postgres databases
 migrations/                goose SQL migrations (embedded)
+deploy/                    prometheus rules, grafana dashboard, kubernetes manifests
 docs/                      architecture.md, plan.md
 ```
 

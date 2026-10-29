@@ -1,0 +1,150 @@
+# Alert rules for the webhook delivery system. Unit-tested in alerts_test.yml:
+#   promtool check rules deploy/prometheus/alerts.yml
+#   promtool test rules  deploy/prometheus/alerts_test.yml
+#
+# Every worker samples queue state, so those gauges are aggregated with max(),
+# never sum(). Counters are summed across replicas.
+
+groups:
+  # ---------------------------------------------------------------- SLOs
+  - name: webhook.slo
+    rules:
+      # Delivery success SLI: of the deliveries that reached a final outcome, the
+      # fraction that succeeded. Retries are not failures (they are the system
+      # working), and endpoint_gone (410) is the customer's choice, so neither counts.
+      - record: webhook:deliveries_final:rate5m
+        expr: sum(rate(webhook_deliveries_total{outcome=~"succeeded|dead_max_attempts"}[5m]))
+      - record: webhook:deliveries_final:rate30m
+        expr: sum(rate(webhook_deliveries_total{outcome=~"succeeded|dead_max_attempts"}[30m]))
+      - record: webhook:deliveries_final:rate1h
+        expr: sum(rate(webhook_deliveries_total{outcome=~"succeeded|dead_max_attempts"}[1h]))
+      - record: webhook:deliveries_final:rate6h
+        expr: sum(rate(webhook_deliveries_total{outcome=~"succeeded|dead_max_attempts"}[6h]))
+      - record: webhook:delivery_error_ratio:rate5m
+        expr: sum(rate(webhook_deliveries_total{outcome="dead_max_attempts"}[5m])) / webhook:deliveries_final:rate5m
+      - record: webhook:delivery_error_ratio:rate30m
+        expr: sum(rate(webhook_deliveries_total{outcome="dead_max_attempts"}[30m])) / webhook:deliveries_final:rate30m
+      - record: webhook:delivery_error_ratio:rate1h
+        expr: sum(rate(webhook_deliveries_total{outcome="dead_max_attempts"}[1h])) / webhook:deliveries_final:rate1h
+      - record: webhook:delivery_error_ratio:rate6h
+        expr: sum(rate(webhook_deliveries_total{outcome="dead_max_attempts"}[6h])) / webhook:deliveries_final:rate6h
+
+      # Multi-window, multi-burn-rate alerts for a 99% success SLO (1% error budget):
+      # 14.4x burn over 1h would spend 2% of a 30-day budget in an hour (page); 6x over
+      # 6h spends 5% in six hours (ticket). The short window makes the alert reset quickly.
+      - alert: WebhookErrorBudgetBurnFast
+        expr: |
+          webhook:delivery_error_ratio:rate1h > (14.4 * 0.01)
+          and webhook:delivery_error_ratio:rate5m > (14.4 * 0.01)
+          and webhook:deliveries_final:rate1h > 0.01
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Deliveries are failing fast enough to exhaust the monthly error budget in about two days
+          description: "{{ $value | humanizePercentage }} of final delivery outcomes over the last hour were failures (SLO: 99% succeed)."
+      - alert: WebhookErrorBudgetBurnSlow
+        expr: |
+          webhook:delivery_error_ratio:rate6h > (6 * 0.01)
+          and webhook:delivery_error_ratio:rate30m > (6 * 0.01)
+          and webhook:deliveries_final:rate6h > 0.01
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Delivery failures are steadily consuming the error budget
+          description: "{{ $value | humanizePercentage }} of final delivery outcomes over the last six hours were failures (SLO: 99% succeed)."
+
+      # The platform's own latency: how long claimable work has been waiting.
+      # Work held for paused endpoints and open circuits is excluded at the source.
+      - alert: WebhookQueueLatencyHigh
+        expr: max(webhook_oldest_pending_age_seconds) > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Deliveries have been waiting more than 5 minutes to be attempted
+          description: "The oldest claimable delivery is {{ $value | humanizeDuration }} old. Workers may be down, saturated, or the database slow."
+      - alert: WebhookQueueLatencyCritical
+        expr: max(webhook_oldest_pending_age_seconds) > 900
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Deliveries have been waiting more than 15 minutes to be attempted
+          description: "The oldest claimable delivery is {{ $value | humanizeDuration }} old."
+
+  # ------------------------------------------------------------ pipeline
+  - name: webhook.pipeline
+    rules:
+      - alert: WebhookDLQGrowing
+        expr: sum(increase(webhook_deliveries_total{outcome=~"dead_.*"}[15m])) > 50
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Many deliveries are being dead-lettered
+          description: "{{ $value | printf \"%.0f\" }} deliveries entered the DLQ in the last 15 minutes. Check dead_endpoint_gone vs dead_max_attempts on the dashboard."
+      - alert: WebhookLeaseReclaimSpike
+        expr: sum(increase(webhook_lease_reclaims_total[10m])) > 10
+        labels: { severity: warning }
+        annotations:
+          summary: Workers are crashing or stalling mid-delivery
+          description: "{{ $value | printf \"%.0f\" }} deliveries were recovered from expired leases in 10 minutes."
+      - alert: WebhookManyCircuitsOpen
+        expr: max(webhook_endpoints{state="circuit_open"}) > 20
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: Many customer endpoints are currently failing (circuit open)
+      - alert: WebhookClaimErrors
+        expr: sum(rate(webhook_claim_errors_total[5m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Workers cannot claim deliveries (database problem?)
+      - alert: WebhookQueueStatsStale
+        expr: time() - max(webhook_queue_stats_last_success_timestamp_seconds) > 120
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: Queue state is no longer being sampled, so queue alerts may be blind
+      - alert: WebhookNoWorkers
+        # sum(up) is 0 when targets exist but are down; absent() covers no targets at all.
+        # (count(up == 1) == 0 would never fire: count() of an empty vector is empty, not 0.)
+        expr: sum(up{job="worker"}) == 0 or absent(up{job="worker"})
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: No worker is up; nothing is being delivered
+
+  # ----------------------------------------------------------------- API
+  - name: webhook.api
+    rules:
+      - alert: WebhookAPIDown
+        expr: sum(up{job="api"}) == 0 or absent(up{job="api"})
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: No API instance is up; events cannot be ingested
+      - alert: WebhookAPIErrorRate
+        expr: |
+          sum(rate(webhook_http_requests_total{code=~"5.."}[5m])) / sum(rate(webhook_http_requests_total[5m])) > 0.05
+          and sum(rate(webhook_http_requests_total[5m])) > 0.1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: More than 5% of API requests are failing with 5xx
+      - alert: WebhookIngestLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(webhook_http_request_duration_seconds_bucket{route="POST /v1/events"}[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: p99 event ingest latency is above 1 second
+      - alert: WebhookIngestThrottled
+        expr: sum(rate(webhook_ingest_rejected_total[5m])) > 1
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: Tenants are being throttled at ingest (rate or backlog quota)
+      - alert: WebhookQuotaChecksFailing
+        expr: sum(rate(webhook_quota_check_errors_total[5m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Quota checks are failing and ingest is running without limits (fail-open)

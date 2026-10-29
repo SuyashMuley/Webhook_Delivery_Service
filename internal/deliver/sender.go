@@ -65,8 +65,12 @@ func NewSender(timeout time.Duration, allowPrivateTargets bool) *Sender {
 	transport := &http.Transport{
 		DialContext:         dialer.DialContext,
 		TLSHandshakeTimeout: 5 * time.Second,
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 4,
+		// A worker runs up to WORKER_CONCURRENCY deliveries at once and many tenants'
+		// endpoints sit behind the same few hosts, so far more than the stdlib default of
+		// 2 connections per host must be kept for reuse. Dialing per delivery exhausts
+		// ephemeral ports (TIME_WAIT) under load and pays a TLS handshake every time.
+		MaxIdleConns:        4096,
+		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}

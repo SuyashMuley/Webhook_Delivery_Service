@@ -51,16 +51,25 @@ func TestOpenRejectsWrongContextAndTampering(t *testing.T) {
 		t.Error("a sealed secret opened under a different endpoint's context")
 	}
 
+	// Flip a real byte of the ciphertext. (Flipping the last base64 character is
+	// not enough: its low bits can be padding that decodes to the same bytes.)
 	parts := strings.Split(sealed, ".")
-	flipped := []byte(parts[3])
-	if flipped[len(flipped)-1] == 'A' {
-		flipped[len(flipped)-1] = 'B'
-	} else {
-		flipped[len(flipped)-1] = 'A'
+	ct, err := b64.DecodeString(parts[3])
+	if err != nil {
+		t.Fatal(err)
 	}
-	parts[3] = string(flipped)
+	ct[len(ct)/2] ^= 0x01
+	parts[3] = b64.EncodeToString(ct)
 	if _, err := r.Open(strings.Join(parts, "."), "ep1/sec1"); err == nil {
 		t.Error("tampered ciphertext was accepted")
+	}
+	// Likewise for the wrapped data key.
+	parts = strings.Split(sealed, ".")
+	wrapped, _ := b64.DecodeString(parts[2])
+	wrapped[len(wrapped)/2] ^= 0x01
+	parts[2] = b64.EncodeToString(wrapped)
+	if _, err := r.Open(strings.Join(parts, "."), "ep1/sec1"); err == nil {
+		t.Error("tampered wrapped data key was accepted")
 	}
 
 	for _, bad := range []string{"", "plaintext", "v2.k1.a.b", "v1.k1.a"} {

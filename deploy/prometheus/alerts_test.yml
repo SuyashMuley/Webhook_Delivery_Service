@@ -1,0 +1,193 @@
+# promtool test rules deploy/prometheus/alerts_test.yml
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # -- queue latency: only a *sustained* breach pages
+  - name: queue latency warns after 5 sustained minutes above 300s
+    interval: 1m
+    input_series:
+      - series: 'webhook_oldest_pending_age_seconds{instance="w1"}'
+        values: '10 10 400 400 400 400 400 400 400 10'
+      - series: 'webhook_oldest_pending_age_seconds{instance="w2"}'
+        values: '0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m   # above 300 for only 2 minutes so far
+        alertname: WebhookQueueLatencyHigh
+        exp_alerts: []
+      - eval_time: 8m   # above for 6 minutes
+        alertname: WebhookQueueLatencyHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Deliveries have been waiting more than 5 minutes to be attempted
+              description: "The oldest claimable delivery is 6m 40s old. Workers may be down, saturated, or the database slow."
+      - eval_time: 9m   # recovered
+        alertname: WebhookQueueLatencyHigh
+        exp_alerts: []
+      - eval_time: 8m   # 400s is not above the critical 900s threshold
+        alertname: WebhookQueueLatencyCritical
+        exp_alerts: []
+
+  # -- error budget: a failing fleet pages, a healthy one with a few failures does not
+  - name: fast burn pages when over 14.4% of final outcomes fail
+    interval: 1m
+    input_series:
+      # 10 successes/min and 5 failures/min: a 33% error ratio, from the start
+      - series: 'webhook_deliveries_total{outcome="succeeded",instance="w1"}'
+        values: '0+10x180'
+      - series: 'webhook_deliveries_total{outcome="dead_max_attempts",instance="w1"}'
+        values: '0+5x180'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: WebhookErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Deliveries are failing fast enough to exhaust the monthly error budget in about two days
+              description: "33.33% of final delivery outcomes over the last hour were failures (SLO: 99% succeed)."
+
+  - name: no burn alert at a 0.5% failure rate (inside the 1% budget)
+    interval: 1m
+    input_series:
+      - series: 'webhook_deliveries_total{outcome="succeeded",instance="w1"}'
+        values: '0+199x400'
+      - series: 'webhook_deliveries_total{outcome="dead_max_attempts",instance="w1"}'
+        values: '0+1x400'
+    alert_rule_test:
+      - eval_time: 380m
+        alertname: WebhookErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 380m
+        alertname: WebhookErrorBudgetBurnSlow
+        exp_alerts: []
+
+  - name: 410s and retries do not burn the error budget
+    interval: 1m
+    input_series:
+      - series: 'webhook_deliveries_total{outcome="succeeded",instance="w1"}'
+        values: '0+10x200'
+      - series: 'webhook_deliveries_total{outcome="dead_endpoint_gone",instance="w1"}'
+        values: '0+50x200'
+      - series: 'webhook_deliveries_total{outcome="retry",instance="w1"}'
+        values: '0+100x200'
+    alert_rule_test:
+      - eval_time: 190m
+        alertname: WebhookErrorBudgetBurnFast
+        exp_alerts: []
+
+  - name: an idle system does not trip the burn alert on noise
+    interval: 1m
+    input_series:
+      # one failed delivery an hour: 100% error ratio, but far too little traffic to matter
+      - series: 'webhook_deliveries_total{outcome="dead_max_attempts",instance="w1"}'
+        values: '0+0x59 1+0x200'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: WebhookErrorBudgetBurnFast
+        exp_alerts: []
+
+  # -- pipeline
+  - name: DLQ growth
+    interval: 1m
+    input_series:
+      - series: 'webhook_deliveries_total{outcome="dead_max_attempts",instance="w1"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WebhookDLQGrowing
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Many deliveries are being dead-lettered
+              description: "150 deliveries entered the DLQ in the last 15 minutes. Check dead_endpoint_gone vs dead_max_attempts on the dashboard."
+
+  - name: crashing workers show up as a lease reclaim spike
+    interval: 1m
+    input_series:
+      - series: 'webhook_lease_reclaims_total{result="requeued",instance="w1"}'
+        values: '0 0 0 5 10 15 20 25 25 25 25 25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: WebhookLeaseReclaimSpike
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Workers are crashing or stalling mid-delivery
+              description: "25 deliveries were recovered from expired leases in 10 minutes."
+
+  - name: losing every worker pages
+    interval: 1m
+    input_series:
+      - series: 'up{job="worker",instance="w1"}'
+        values: '1 1 1 0 0 0 0'
+      - series: 'up{job="api",instance="a1"}'
+        values: '1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: WebhookNoWorkers
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: WebhookNoWorkers
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations: { summary: No worker is up; nothing is being delivered }
+      - eval_time: 6m
+        alertname: WebhookAPIDown
+        exp_alerts: []
+
+  - name: losing the API pages, including when its series vanish entirely
+    interval: 1m
+    input_series:
+      - series: 'up{job="api",instance="a1"}'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WebhookAPIDown
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations: { summary: No API instance is up; events cannot be ingested }
+
+  - name: no API series at all is also an outage
+    interval: 1m
+    input_series:
+      - series: 'up{job="worker",instance="w1"}'
+        values: '1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WebhookAPIDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: api }  # absent() carries the matcher's labels
+            exp_annotations: { summary: No API instance is up; events cannot be ingested }
+
+  - name: stale queue sampling is detected
+    interval: 1m
+    input_series:
+      - series: 'webhook_queue_stats_last_success_timestamp_seconds{instance="w1"}'
+        values: '0+60x3 180x20'   # sampled every minute, then stops
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: WebhookQueueStatsStale
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: WebhookQueueStatsStale
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: "Queue state is no longer being sampled, so queue alerts may be blind" }
+
+  # -- API
+  - name: API 5xx rate pages only with real traffic
+    interval: 1m
+    input_series:
+      - series: 'webhook_http_requests_total{route="POST /v1/events",code="202",method="POST",instance="a1"}'
+        values: '0+60x20'
+      - series: 'webhook_http_requests_total{route="POST /v1/events",code="500",method="POST",instance="a1"}'
+        values: '0+30x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WebhookAPIErrorRate
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations: { summary: More than 5% of API requests are failing with 5xx }

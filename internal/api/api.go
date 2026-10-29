@@ -7,16 +7,33 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"webhookdelivery/internal/auth"
+	"webhookdelivery/internal/metrics"
+	"webhookdelivery/internal/ratelimit"
+	"webhookdelivery/internal/server"
 	"webhookdelivery/internal/store"
 )
 
 type Options struct {
 	AllowInsecureURLs bool // permit http:// endpoint URLs (dev only)
 	MaxAttempts       int  // attempts per delivery before it is dead-lettered
+
+	Quota   *ratelimit.Quota // per-tenant ingest rate and backlog limits; nil disables them
+	Metrics *metrics.Metrics // optional
+	// RequestTimeout bounds every request, database calls included. Without it a
+	// database that stops answering would hang requests for as long as the outage
+	// lasts; with it producers get a prompt 503 and retry. Default 5s.
+	RequestTimeout time.Duration
+	// Wake is called after an event that created deliveries has committed, to wake
+	// idle workers (see store.Notifier). Optional.
+	Wake func()
 }
 
 type API struct {
@@ -28,6 +45,9 @@ type API struct {
 func New(s *store.Store, log *slog.Logger, opts Options) *API {
 	if opts.MaxAttempts < 1 {
 		opts.MaxAttempts = 8
+	}
+	if opts.RequestTimeout <= 0 {
+		opts.RequestTimeout = 5 * time.Second
 	}
 	return &API{store: s, log: log, opts: opts}
 }
@@ -57,6 +77,10 @@ type tenantKey struct{}
 
 func (a *API) authenticate(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), a.opts.RequestTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
+
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || token == "" {
 			a.writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed Authorization header; expected 'Bearer <api key>'")
@@ -71,6 +95,7 @@ func (a *API) authenticate(next http.HandlerFunc) http.Handler {
 			a.internalError(w, r, err)
 			return
 		}
+		server.SetTenant(r.Context(), tenantID)
 		next(w, r.WithContext(context.WithValue(r.Context(), tenantKey{}, tenantID)))
 	})
 }
@@ -93,6 +118,14 @@ func (a *API) writeError(w http.ResponseWriter, status int, code, msg string) {
 }
 
 func (a *API) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	if unavailable(err) {
+		// The database is not answering: tell the producer to back off and retry
+		// (with its Idempotency-Key) instead of reporting a bug.
+		a.log.Warn("database unavailable", "method", r.Method, "path", r.URL.Path, "error", err)
+		w.Header().Set("Retry-After", "2")
+		a.writeError(w, http.StatusServiceUnavailable, "unavailable", "the service is temporarily unavailable; retry shortly")
+		return
+	}
 	a.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
 	a.writeError(w, http.StatusInternalServerError, "internal", "internal server error")
 }
@@ -123,6 +156,29 @@ func (a *API) decode(w http.ResponseWriter, r *http.Request, dst any, maxBytes i
 		a.writeError(w, http.StatusBadRequest, "invalid_request", "request body is empty")
 	default:
 		a.writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+	}
+	return false
+}
+
+// unavailable reports whether err means the database could not be reached or did
+// not answer in time, as opposed to a bug or a bad request: our own deadline
+// expiring, a network error, a dropped connection, or Postgres shutting down.
+func unavailable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var connErr *pgconn.ConnectError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// class 08: connection exception; 57P01-03: admin shutdown, crash shutdown, cannot connect now
+		return strings.HasPrefix(pgErr.Code, "08") || strings.HasPrefix(pgErr.Code, "57P0")
 	}
 	return false
 }

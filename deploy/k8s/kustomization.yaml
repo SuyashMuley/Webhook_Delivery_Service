@@ -1,0 +1,22 @@
+# Base for deploying the webhook delivery system:
+#   kubectl kustomize deploy/k8s | kubectl apply -f -
+# Create the Secrets from secret.example.yaml first, and run the migrate Job
+# before the Deployments on every release.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: webhooks
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - configmap.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - pdb.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+# Point the images at your registry and pin a version tag per release, e.g.:
+# images:
+#   - { name: webhook-delivery-api,     newName: ghcr.io/OWNER/webhook-delivery-api,     newTag: v1.0.0 }
+#   - { name: webhook-delivery-worker,  newName: ghcr.io/OWNER/webhook-delivery-worker,  newTag: v1.0.0 }
+#   - { name: webhook-delivery-migrate, newName: ghcr.io/OWNER/webhook-delivery-migrate, newTag: v1.0.0 }

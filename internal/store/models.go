@@ -162,6 +162,8 @@ type ClaimedDelivery struct {
 	EventType      string
 	Payload        json.RawMessage
 	EventCreatedAt time.Time
+	CreatedAt      time.Time // when the delivery was enqueued
+	TraceContext   string    // W3C traceparent of the ingest request, "" if none
 	URL            string
 	Secrets        []Secret // decrypted (Value set), including ones that have expired
 	SecretsErr     error    // set if the endpoint's secrets could not be decrypted
@@ -178,4 +180,37 @@ type Attempt struct {
 	// rather than the endpoint's: it still consumes an attempt but does not
 	// count against the endpoint's circuit breaker.
 	Local bool
+}
+
+// QueueStats is a point-in-time sample of the queue, for metrics.
+type QueueStats struct {
+	Due          int // pending and due now
+	Scheduled    int // pending, waiting for a retry time
+	InFlight     int
+	DeadByReason map[string]int
+
+	// OldestDueAge is the age of the oldest due delivery that a worker could
+	// claim right now: its endpoint is active with a closed circuit and a free
+	// concurrency slot, and its tenant is active and under its in-flight cap.
+	// Work held back on purpose (paused endpoints, open circuits) or waiting on a
+	// customer's own limits (a slow endpoint at its concurrency cap) is not the
+	// platform's latency and is excluded.
+	OldestDueAge time.Duration
+
+	CircuitOpenEndpoints int
+	PausedEndpoints      int
+	DisabledEndpoints    int
+}
+
+// TenantLimits are the per-tenant quotas enforced at ingest.
+type TenantLimits struct {
+	EventsPerSec int
+	MaxPending   int
+}
+
+// PurgeResult counts rows removed by one retention pass.
+type PurgeResult struct {
+	Succeeded int
+	Dead      int
+	Events    int
 }

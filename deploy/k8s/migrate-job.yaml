@@ -1,0 +1,36 @@
+# Applies database migrations. Run it before rolling out a new version (for
+# example as an Argo CD PreSync hook or a Helm pre-upgrade hook). Migrations are
+# forward-compatible with the previous release, so old pods keep working during a rollout.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: webhook-migrate
+  labels: { app.kubernetes.io/name: webhook-migrate }
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: webhook-migrate }
+    spec:
+      restartPolicy: Never
+      serviceAccountName: webhook-migrate
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: webhook-delivery-migrate:latest
+          args: ["up"]
+          envFrom:
+            - secretRef: { name: webhook-db-owner }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

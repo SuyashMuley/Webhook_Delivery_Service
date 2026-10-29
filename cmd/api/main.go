@@ -3,15 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"webhookdelivery/internal/api"
 	"webhookdelivery/internal/config"
 	"webhookdelivery/internal/logging"
+	"webhookdelivery/internal/metrics"
+	"webhookdelivery/internal/ratelimit"
 	"webhookdelivery/internal/server"
 	"webhookdelivery/internal/store"
+	"webhookdelivery/internal/telemetry"
 )
 
 func main() {
@@ -39,20 +46,54 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	flush, err := telemetry.Setup(ctx, telemetry.Config{Service: "api", Endpoint: cfg.OTLPEndpoint, SampleRatio: cfg.TraceSampleRatio})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = flush(fctx)
+	}()
+
 	var opts []store.Option
 	if cfg.DBRole != "" {
 		opts = append(opts, store.WithRole(cfg.DBRole))
 	}
-	db, err := store.Connect(ctx, cfg.DatabaseURL, opts...)
+	db, err := store.ConnectWithRetry(ctx, cfg.DatabaseURL, 60*time.Second, opts...)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 	db.Sealer = ring
 
-	mux := server.NewMux(db)
+	m := metrics.New()
+	notifier := db.NewNotifier(10 * time.Millisecond)
+	go notifier.Run(ctx)
+	drain := &server.Drain{}
+	mux := server.NewMux(db, drain)
 	// Plain-http and internal endpoint URLs are convenient locally and forbidden in production.
-	api.New(db, log, api.Options{AllowInsecureURLs: cfg.AllowPrivateTargets, MaxAttempts: cfg.MaxAttempts}).Register(mux)
+	api.New(db, log, api.Options{
+		AllowInsecureURLs: cfg.AllowPrivateTargets,
+		MaxAttempts:       cfg.MaxAttempts,
+		RequestTimeout:    cfg.APIRequestTimeout,
+		Quota:             ratelimit.New(db, m, log, ratelimit.Config{}),
+		Metrics:           m,
+		Wake:              notifier.Notify,
+	}).Register(mux)
 
-	return server.Run(ctx, log, cfg.HTTPAddr, mux, cfg.ShutdownTimeout)
+	// The /metrics server is separate from the public one so the ingress never exposes it.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return server.Run(gctx, log, cfg.HTTPAddr, server.Instrument(log, m, mux), cfg.ShutdownTimeout,
+			server.WithDrain(drain, cfg.DrainDelay))
+	})
+	if cfg.MetricsAddr != "" {
+		g.Go(func() error {
+			mm := http.NewServeMux()
+			mm.Handle("GET /metrics", m.Handler())
+			return server.Run(gctx, log, cfg.MetricsAddr, mm, 5*time.Second)
+		})
+	}
+	return g.Wait()
 }
