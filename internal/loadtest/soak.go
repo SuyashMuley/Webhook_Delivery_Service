@@ -45,7 +45,7 @@ func (s *Soak) Run(ctx context.Context, start time.Time, interval time.Duration,
 		smp := Sample{At: time.Since(start).Round(time.Second), RSSMB: map[string]float64{}}
 		for _, p := range procs {
 			if pid := p.Pid(); pid != 0 {
-				if out, err := exec.CommandContext(ctx, "ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output(); err == nil {
+				if out, err := exec.CommandContext(ctx, "ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output(); err == nil { //nolint:gosec // fixed binary; the pid is of a child this package started
 					kb, _ := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 					smp.RSSMB[p.Name] = kb / 1024
 				}
