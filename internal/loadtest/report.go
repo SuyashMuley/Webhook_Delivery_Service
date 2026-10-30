@@ -165,3 +165,41 @@ func (r *Report) WriteJSON(path string) error {
 	}
 	return os.WriteFile(path, b, 0o600)
 }
+
+// Window is the latency of deliveries first received within one slice of the run.
+type Window struct {
+	Start    time.Duration
+	N        int
+	P50, P99 time.Duration
+}
+
+// WindowedLatency buckets request-to-first-receipt latency by when the delivery was
+// first received, so drift over a long run (a slow leak, growing tables) is visible
+// instead of being averaged away.
+func WindowedLatency(gen *GenResult, tenants []Tenant, recv *Receiver, start time.Time, window time.Duration) []Window {
+	buckets := map[int]*Samples{}
+	for _, ev := range gen.Events {
+		for _, ep := range tenants[ev.Tenant].Endpoints {
+			first, ok := recv.FirstSeen(ev.ID, ep)
+			if !ok {
+				continue
+			}
+			i := int(first.Sub(start) / window)
+			if i < 0 {
+				i = 0
+			}
+			if buckets[i] == nil {
+				buckets[i] = &Samples{}
+			}
+			buckets[i].Add(first.Sub(ev.Start))
+		}
+	}
+	var out []Window
+	for i := 0; i < len(buckets)+1000 && len(out) < len(buckets); i++ {
+		if b, ok := buckets[i]; ok {
+			sum := b.Summary()
+			out = append(out, Window{Start: time.Duration(i) * window, N: sum.N, P50: sum.P50, P99: sum.P99})
+		}
+	}
+	return out
+}

@@ -34,3 +34,11 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: db-ca, mountPath: /etc/webhook/db-ca, readOnly: true }
+      volumes:
+        # Optional CA bundle for sslmode=verify-full against a database whose CA is not publicly
+        # trusted. Create the Secret `webhook-db-ca` with a `ca.crt` key and add
+        # sslrootcert=/etc/webhook/db-ca/ca.crt to DATABASE_URL (see secret.example.yaml).
+        - name: db-ca
+          secret: { secretName: webhook-db-ca, optional: true }

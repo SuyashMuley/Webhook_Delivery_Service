@@ -109,12 +109,14 @@ func (s *Store) Purge(ctx context.Context, succeededAge, deadAge, eventAge time.
 		}
 	}
 	if eventAge > 0 {
+		// No FOR UPDATE here: it needs UPDATE on events, which the worker role (rightly) lacks.
+		// Two purgers racing for a row just means one deletes it and the other deletes nothing.
 		r.Events, err = s.deleteBatch(ctx,
 			`WITH doomed AS (
 			    SELECT e.id FROM events e
 			     WHERE e.created_at < now() - make_interval(secs => $1)
 			       AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.event_id = e.id)
-			     ORDER BY e.created_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+			     ORDER BY e.created_at LIMIT $2)
 			 DELETE FROM events e USING doomed WHERE e.id = doomed.id`, eventAge.Seconds(), limit)
 	}
 	return r, err

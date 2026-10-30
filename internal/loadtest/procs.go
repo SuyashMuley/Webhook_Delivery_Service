@@ -67,6 +67,9 @@ func (p *Proc) pid() (int, chan struct{}) {
 	return p.cmd.Process.Pid, p.done
 }
 
+// Pid is the process id, or 0 if it is not running.
+func (p *Proc) Pid() int { pid, _ := p.pid(); return pid }
+
 func (p *Proc) Alive() bool { pid, _ := p.pid(); return pid != 0 }
 
 // Kill is `kill -9`: no signal handlers run, no drain, nothing is released.

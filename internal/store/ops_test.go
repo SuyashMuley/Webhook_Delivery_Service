@@ -262,3 +262,22 @@ func TestPendingBacklogIsBounded(t *testing.T) {
 		t.Fatalf("backlog with cap 10 = %d; the count must stop at the cap", n)
 	}
 }
+
+// The worker role has only SELECT and DELETE on events. Running purge as the table owner
+// (as the other test does) hides any statement that needs more, such as SELECT ... FOR UPDATE.
+func TestPurgeWorksUnderTheWorkerRole(t *testing.T) {
+	owner := testutil.NewStore(t)
+	ctx := context.Background()
+	seedTenant(t, owner, "acme", 3)
+	exec(t, owner, `UPDATE deliveries SET status = 'succeeded', updated_at = now() - interval '10 days'`)
+	exec(t, owner, `UPDATE events SET created_at = now() - interval '20 days'`)
+
+	worker := testutil.WithRole(t, owner, store.RoleWorker)
+	res, err := worker.Purge(ctx, 7*24*time.Hour, 30*24*time.Hour, 7*24*time.Hour, 100)
+	if err != nil {
+		t.Fatalf("purge as the worker role: %v", err)
+	}
+	if res.Succeeded != 3 || res.Events != 3 {
+		t.Fatalf("purged %+v, want 3 deliveries and 3 events", res)
+	}
+}

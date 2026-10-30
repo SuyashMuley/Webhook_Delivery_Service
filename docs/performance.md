@@ -7,7 +7,7 @@ What was measured, how, what it showed, the bugs it found, and what it does **no
 - **Target met with headroom.** 2,000 deliveries/s sustained for 60s with a p99 of **18 ms** from request to first receipt (24 ms by the workers' own histogram), zero retries, zero failures. 4,000 deliveries/s sustained with p99 319 ms.
 - **Nothing was lost in any of the ten runs** (four load levels and six fault scenarios), including repeated `kill -9` of workers and API servers, database network partitions, a Postgres restart and a `SIGKILL` crash with WAL recovery, a receiver that fails in six different ways, and all of it at once. Every accepted event ended with one delivery per endpoint, each `succeeded` (none stuck, none lost).
 - **Delivery is at-least-once, and the duplicates are measured**, not hand-waved: 0 in clean runs, 13 after five worker crashes, ~2,300 when receivers answer after the sender's timeout.
-- The load test found **six real defects** in the system as built through Phase 4 (listed below), the worst of which capped throughput at ~650 deliveries/s. All are fixed, with regression tests.
+- The load test found **seven real defects** in the system as built through Phase 4 (listed below), the worst of which capped throughput at ~650 deliveries/s. All are fixed, with regression tests.
 
 ## Method
 
@@ -74,6 +74,25 @@ I did **not** profile the ~4,000/s ceiling after the fixes below, so I can say i
 
 Latency under faults is high **by design** (retries, timeouts, backoff): in `mixed` the median first receipt is 19 s. The claim being tested is correctness under failure, not latency under failure.
 
+### Soak: 30 minutes at 1,000 deliveries/s with retention on
+
+`./bin/loadtest -scenario none -rate 200 -fanout 5 -duration 30m -purge -sample 30s`. Retention ran every 20 s with 2-minute windows, so the purge cycled about 90 times. 360,001 events, 1,800,005 deliveries: all accepted, all delivered, 0 retries, 0 duplicates, 0 unacknowledged.
+
+| | Start (t+5m) | End (t+30m) |
+|---|---|---|
+| API RSS | 27-28 MB | 29-31 MB (+5 to +10%) |
+| Worker RSS | 33 MB | 37-38 MB (+13 to +15%) |
+| Database size | 130 MB | 138 MB |
+| `deliveries` live rows / dead tuples | 134k / 102k | 140k / 96k (autovacuum ran 25 more times) |
+
+Latency by 5-minute window: p50 6.9, 7.0, 7.2, 8.1, 8.3, 7.2 ms; p99 17, 18, 23, 71 ms, **2.06 s**, 21 ms.
+
+- **Bloat is bounded**: the table size and live rows stay flat, so purge plus autovacuum keep up.
+- **Memory still crept up** by a few MB. 30 minutes cannot tell a slow leak from a cache that has not finished warming; this is unresolved. A longer run with heap profiles would settle it.
+- **One unexplained latency event**: around t+23m a backlog of about 1,400 deliveries built for roughly 10 s (workers' throughput dipped to 750/s), giving the 2 s p99 in that window; it drained by itself. I did not identify the cause (checkpoint, autovacuum and GC are all candidates).
+- The invariant checker only examines events younger than the retention window when `-purge` is set, because older ones are deleted on purpose. The 4-minute validation run passed all invariants.
+- **Bug found by this run**: the retention purge failed every cycle under the real `webhooks_worker` role (see defect 7).
+
 ## Defects found by this phase
 
 All present in the system as it stood after Phase 4, all fixed, each with a regression test.
@@ -84,6 +103,7 @@ All present in the system as it stood after Phase 4, all fixed, each with a regr
 4. **The worker binary never enabled the wake-up.** A scripted edit silently matched nothing. In-process tests could not see it; the real-process load test did, because latency did not improve.
 5. **A database stall hung every API request for the whole outage** (ingest p99 of ~10 s). Requests now have a deadline (`API_REQUEST_TIMEOUT`, 5 s) and an unreachable database maps to `503` with `Retry-After`. (`TestDatabaseOutageGivesAPrompt503WithRetryAfter`)
 6. **A service restarted during a database blip crashed instead of waiting**, and stayed down. Services now retry the initial connection for up to 60 s; a malformed URL still fails immediately. (`TestConnectWithRetryWaitsForTheDatabase`)
+7. **Retention never purged events in production.** The events purge used `SELECT ... FOR UPDATE SKIP LOCKED`, which needs `UPDATE` on `events`; the worker role only has `SELECT` and `DELETE` (events are immutable). The error also aborted the purge loop, so deliveries were purged one batch per cycle, far slower than they arrived (1.29M live rows and 854 MB after 25 minutes instead of about 130k). Tests passed because they ran as the table owner. Now no row lock is used; `TestPurgeWorksUnderTheWorkerRole` fails on the old query. Found by the soak, not by any earlier test.
 
 Smaller finds in the test tooling itself, noted because they would have invalidated results: the fault proxy consumed a byte of the data stream while polling for a closed client; the Prometheus text parser panics without an explicit validation scheme; several of my own tests were flaky or wrong (racy gauge reads, `LIMIT 1` without `ORDER BY`, a timeout too short for the deliberately slow case).
 
@@ -93,7 +113,7 @@ Be careful not to over-read the results.
 
 - **Hardware.** One shared laptop. Absolute throughput will differ; relative behaviour (graceful degradation, no loss) is the finding.
 - **No TLS and a trivially fast receiver on loopback.** Real endpoints add handshake cost, latency and variance. Connection reuse (finding 1) matters more, not less, there.
-- **Short runs, single samples.** 45-150 s each, one run per scenario, so no confidence intervals. Nothing here tests slow leaks, memory growth, table and index bloat, or autovacuum behaviour under sustained load. The retention job was off during runs, so purge cost under load is unmeasured.
+- **Short runs, single samples.** 45-150 s each, one run per scenario, so no confidence intervals. The fault and throughput runs had retention off. One 30-minute soak (above) covers bloat, autovacuum and purge, but not hours-long behaviour, and its memory trend is inconclusive.
 - **Small scale in the dimensions that matter for fairness:** 20-40 tenants and 100-200 endpoints, not thousands. The claim query's cost grows with tenants and endpoints probed per claim (see `docs/plan.md`); that scaling was benchmarked in isolation but not in these end-to-end runs.
 - **Single Postgres on a local Docker volume.** Not tested: replica failover, replication lag, a full disk, a slow disk, or a managed service's behaviour. The "crash" is `SIGKILL` of the container; a real power loss with different fsync semantics is not simulated.
 - **Network faults are only between the services and Postgres** (plus an abusive receiver). Not tested: partitions between API and workers (they do not talk to each other), between a worker and the internet specifically, DNS failures, or clock skew between hosts.

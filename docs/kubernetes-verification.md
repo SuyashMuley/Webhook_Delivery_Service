@@ -52,7 +52,7 @@ Four producer pods inside the cluster sent 3,200 events with **no retries**, so 
 ## What this does not show
 
 - **The worker scale-down after the fix:** scale-down was observed before the signal change, not repeated after it. The API's scale-down was never observed. The HPA's production scale-down window (600 s) was shortened to 60 s for the test.
-- **A real ingress controller, a cloud load balancer, real zones, and TLS to the database** (the test database used `sslmode=disable`).
+- **A real ingress controller, a cloud load balancer and real zones.** TLS to the database was checked outside the cluster (`deploy/tls/check.sh`: verify-full with a private CA connects; a missing CA or a host-name mismatch is refused; the real API connected over verified TLSv1.3). The optional `db-ca` mount for a private CA is schema-validated but was not run in the cluster.
 - **The unexplained single `503`.** A rollout storm (14 rolling restarts), an eviction storm (14 evictions) and a drain storm (10 node drains), each under high-rate load with every API pod's log captured, produced 0 failures in 96,000 requests, so pod turnover does not cause it. It remains unexplained and unreproduced.
 - **Long-running behaviour**: each disruption run lasted about 100 seconds.
 - Only the NetworkPolicies as implemented by Calico: other CNIs may differ.

@@ -63,6 +63,8 @@ func run() int {
 		drainWait   = flag.Duration("drain-timeout", 3*time.Minute, "how long to wait for the queue to drain after the load stops")
 		pgContainer = flag.String("pg-container", "", "Postgres container for docker-based faults (default: docker compose's postgres)")
 		keep        = flag.Bool("keep", false, "keep the test database afterwards")
+		purge       = flag.Bool("purge", false, "enable the retention job with short windows (soak testing: exercises purging and vacuum)")
+		sample      = flag.Duration("sample", 0, "sample process memory and table sizes at this interval (0 = off); use for soak runs")
 	)
 	flag.Parse()
 
@@ -146,7 +148,7 @@ func run() int {
 	}
 
 	// ---- start the system under test
-	fleet := buildFleet(*binDir, out, sutURL, *apis, *workers, *concurrency)
+	fleet := buildFleet(*binDir, out, sutURL, *apis, *workers, *concurrency, *purge)
 	for _, p := range fleet.All() {
 		if err := p.Start(); err != nil {
 			logf("start %s: %v", p.Name, err)
@@ -176,6 +178,12 @@ func run() int {
 	faultsDone := make(chan struct{})
 	go func() { defer close(faultsDone); loadtest.RunTimeline(ctx, env, plan, start) }()
 
+	soak := &loadtest.Soak{}
+	if *sample > 0 {
+		sctx, cancelSoak := context.WithCancel(ctx)
+		defer cancelSoak()
+		go soak.Run(sctx, start, *sample, owner.Pool, fleet.All(), logf)
+	}
 	genFinished := make(chan struct{})
 	var generated *loadtest.GenResult
 	go func() {
@@ -209,6 +217,11 @@ func run() int {
 	// ---- verdict
 	var ids []string
 	for _, e := range gen.Events {
+		// With retention on, older events are purged on purpose; check only those still inside
+		// the retention window (the soak uses 2m) so a purge is not mistaken for data loss.
+		if *purge && time.Since(e.Start) > 90*time.Second {
+			continue
+		}
 		ids = append(ids, e.ID)
 	}
 	inv, err := invariants.Check(ctx, owner.Pool, invariants.Expected{EventIDs: ids, Fanout: *fanout, Received: recv})
@@ -246,6 +259,7 @@ func run() int {
 		rep.Verdict = "FAIL"
 	}
 	rep.Print(os.Stdout)
+	printSoak(soak, loadtest.WindowedLatency(gen, tn, recv, start, 5*time.Minute), *sample > 0)
 	if err := rep.WriteJSON(filepath.Join(out, "report.json")); err != nil {
 		logf("write report: %v", err)
 	}
@@ -255,7 +269,7 @@ func run() int {
 	return 0
 }
 
-func buildFleet(binDir, out, dbURL string, apis, workers, concurrency int) *loadtest.Fleet {
+func buildFleet(binDir, out, dbURL string, apis, workers, concurrency int, purge bool) *loadtest.Fleet {
 	common := []string{
 		"DATABASE_URL=" + dbURL, "APP_ENV=dev", "LOG_LEVEL=warn", "LOG_FORMAT=json",
 		"MAX_ATTEMPTS=8", "RETRY_SCHEDULE=1s,2s,3s,5s,5s,5s,5s",
@@ -263,6 +277,9 @@ func buildFleet(binDir, out, dbURL string, apis, workers, concurrency int) *load
 		fmt.Sprintf("WORKER_CONCURRENCY=%d", concurrency), "WORKER_BATCH_SIZE=50", "WORKER_TENANT_SLICE=10",
 		"BREAKER_BASE_OPEN=2s", "BREAKER_MAX_OPEN=5s",
 		"PURGE_INTERVAL=0s", "STATS_INTERVAL=5s", "SHUTDOWN_DRAIN_DELAY=200ms", "WORKER_DRAIN_TIMEOUT=5s",
+	}
+	if purge { // later entries win: retention on, with windows short enough to cycle many times in a soak
+		common = append(common, "PURGE_INTERVAL=20s", "RETAIN_SUCCEEDED=2m", "RETAIN_DEAD=10m", "RETAIN_EVENTS=2m")
 	}
 	f := &loadtest.Fleet{}
 	for i := range apis {
@@ -367,3 +384,35 @@ func randHex(n int) string {
 }
 
 func numCPU() int { return runtime.NumCPU() }
+
+// printSoak reports how the run drifted: latency per 5-minute window, and resource use
+// from the end of warm-up to the end of the run.
+func printSoak(soak *loadtest.Soak, windows []loadtest.Window, sampled bool) {
+	if len(windows) > 1 {
+		fmt.Println("\nLATENCY DRIFT (request to first receipt, by 5-minute window of the run)")
+		for _, w := range windows {
+			fmt.Printf("  from t+%-5v  n=%-8d p50=%-10v p99=%v\n", w.Start, w.N, w.P50.Round(time.Microsecond*100), w.P99.Round(time.Microsecond*100))
+		}
+	}
+	if !sampled {
+		return
+	}
+	first, last, ok := soak.Trend(5 * time.Minute)
+	if !ok {
+		return
+	}
+	fmt.Printf("\nRESOURCE TREND (t+%v after warm-up, to t+%v)\n", first.At, last.At)
+	for name, v := range last.RSSMB {
+		fmt.Printf("  %-9s RSS %.0f MB -> %.0f MB (%+.0f%%)\n", name, first.RSSMB[name], v, pct(first.RSSMB[name], v))
+	}
+	fmt.Printf("  database   %.0f MB -> %.0f MB (%+.0f%%)\n", first.DBMB, last.DBMB, pct(first.DBMB, last.DBMB))
+	fmt.Printf("  deliveries table %.0f MB -> %.0f MB; live rows %d -> %d; dead tuples %d -> %d; autovacuums %d -> %d\n",
+		first.DeliveriesMB, last.DeliveriesMB, first.DeliveriesLive, last.DeliveriesLive, first.DeliveriesDead, last.DeliveriesDead, first.Autovacuums, last.Autovacuums)
+}
+
+func pct(a, b float64) float64 {
+	if a == 0 {
+		return 0
+	}
+	return (b - a) / a * 100
+}
