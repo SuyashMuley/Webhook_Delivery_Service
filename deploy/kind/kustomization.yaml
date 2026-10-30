@@ -1,0 +1,18 @@
+# The base (../k8s) plus what a kind cluster lacks: a database and locally loaded images.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../k8s
+  - postgres.yaml
+patches:
+  # Images are loaded into the nodes with `kind load`, never pulled (":latest" would otherwise mean Always).
+  - target: { kind: Deployment, name: "webhook-.*" }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+  - target: { kind: Job, name: webhook-migrate }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent

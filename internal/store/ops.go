@@ -40,6 +40,25 @@ func (s *Store) QueueStats(ctx context.Context) (QueueStats, error) {
 	}
 	st.OldestDueAge = time.Duration(oldest * float64(time.Second))
 
+	if err := s.Pool.QueryRow(ctx, `
+		WITH ep_in AS (SELECT endpoint_id, count(*) AS n FROM deliveries WHERE status = 'in_flight' GROUP BY 1),
+		     t_in  AS (SELECT tenant_id,   count(*) AS n FROM deliveries WHERE status = 'in_flight' GROUP BY 1),
+		     eligible AS (
+		       SELECT e.id
+		         FROM endpoints e
+		         JOIN tenants t ON t.id = e.tenant_id
+		         LEFT JOIN ep_in ON ep_in.endpoint_id = e.id
+		         LEFT JOIN t_in  ON t_in.tenant_id   = t.id
+		        WHERE e.status = 'active' AND t.status = 'active'
+		          AND (e.circuit_open_until IS NULL OR e.circuit_open_until <= now())
+		          AND COALESCE(ep_in.n, 0) < e.max_concurrency
+		          AND COALESCE(t_in.n, 0)  < t.max_inflight)
+		SELECT COALESCE(sum((SELECT count(*) FROM deliveries d
+		                      WHERE d.endpoint_id = eligible.id AND d.status = 'pending' AND d.next_attempt_at <= now())), 0)
+		  FROM eligible`).Scan(&st.DueClaimable); err != nil {
+		return st, err
+	}
+
 	rows, err := s.Pool.Query(ctx,
 		`SELECT COALESCE(dead_reason, 'unknown'), count(*) FROM deliveries WHERE status = 'dead' GROUP BY 1`)
 	if err != nil {

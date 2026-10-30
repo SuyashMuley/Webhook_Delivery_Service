@@ -66,50 +66,18 @@ func run() error {
 	if cfg.DBRole != "" {
 		opts = append(opts, store.WithRole(cfg.DBRole))
 	}
-	db, err := store.ConnectWithRetry(ctx, cfg.DatabaseURL, 60*time.Second, opts...)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	db.Sealer = ring
-	db.Breaker = store.BreakerPolicy{
-		Threshold:    cfg.BreakerThreshold,
-		BaseOpen:     cfg.BreakerBaseOpen,
-		MaxOpen:      cfg.BreakerMaxOpen,
-		DisableAfter: cfg.AutoDisableAfter,
-	}
-
 	id, err := workerID()
 	if err != nil {
 		return err
 	}
-	m := metrics.New()
-	w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout, cfg.AllowPrivateTargets), log, worker.Config{
-		Metrics:         m,
-		DrainTimeout:    cfg.WorkerDrainTimeout,
-		StatsInterval:   cfg.StatsInterval,
-		PurgeInterval:   cfg.PurgeInterval,
-		RetainSucceeded: cfg.RetainSucceeded,
-		RetainDead:      cfg.RetainDead,
-		RetainEvents:    cfg.RetainEvents,
-		ID:              id,
-		BatchSize:       cfg.WorkerBatchSize,
-		TenantSlice:     cfg.TenantSlice,
-		Concurrency:     cfg.WorkerConcurrency,
-		PollInterval:    cfg.PollInterval,
-		Listen:          cfg.WorkerListen,
-		Lease:           cfg.LeaseDuration,
-		ReaperInterval:  cfg.ReaperInterval,
-		Retry:           retry.Policy{Schedule: cfg.RetrySchedule, MaxRetryAfter: cfg.RetryAfterMax},
-	})
 
-	// The health server and the delivery loop live and die together: if either
-	// stops, the other is cancelled.
-	g, gctx := errgroup.WithContext(ctx)
+	m := metrics.New()
 	drain := &server.Drain{}
+	gate := server.NewGate() // alive immediately, ready once the database is reachable
+
+	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return server.Run(gctx, log, cfg.HTTPAddr, server.NewMux(db, drain), cfg.ShutdownTimeout,
-			server.WithDrain(drain, cfg.DrainDelay))
+		return server.Run(gctx, log, cfg.HTTPAddr, gate, cfg.ShutdownTimeout, server.WithDrain(drain, cfg.DrainDelay))
 	})
 	if cfg.MetricsAddr != "" {
 		g.Go(func() error {
@@ -119,12 +87,49 @@ func run() error {
 		})
 	}
 	g.Go(func() error {
+		db, err := store.ConnectWithRetry(gctx, cfg.DatabaseURL, 60*time.Second,
+			func(err error) { log.Warn("waiting for the database", "error", err) }, opts...)
+		if err != nil {
+			return fmt.Errorf("database: %w", err)
+		}
+		defer db.Close()
+		db.Sealer = ring
+		db.Breaker = store.BreakerPolicy{
+			Threshold:    cfg.BreakerThreshold,
+			BaseOpen:     cfg.BreakerBaseOpen,
+			MaxOpen:      cfg.BreakerMaxOpen,
+			DisableAfter: cfg.AutoDisableAfter,
+		}
+		w := worker.New(db, deliver.NewSender(cfg.DeliveryTimeout, cfg.AllowPrivateTargets), log, worker.Config{
+			Metrics:         m,
+			DrainTimeout:    cfg.WorkerDrainTimeout,
+			StatsInterval:   cfg.StatsInterval,
+			PurgeInterval:   cfg.PurgeInterval,
+			RetainSucceeded: cfg.RetainSucceeded,
+			RetainDead:      cfg.RetainDead,
+			RetainEvents:    cfg.RetainEvents,
+			ID:              id,
+			BatchSize:       cfg.WorkerBatchSize,
+			TenantSlice:     cfg.TenantSlice,
+			Concurrency:     cfg.WorkerConcurrency,
+			PollInterval:    cfg.PollInterval,
+			Listen:          cfg.WorkerListen,
+			Lease:           cfg.LeaseDuration,
+			ReaperInterval:  cfg.ReaperInterval,
+			Retry:           retry.Policy{Schedule: cfg.RetrySchedule, MaxRetryAfter: cfg.RetryAfterMax},
+		})
+		gate.Open(server.NewMux(db, drain))
 		log.Info("worker started", "worker_id", id)
-		return w.Run(gctx)
+
+		// The delivery loops share a fate: if one stops, the others are cancelled. The pool
+		// is closed only after all of them have finished.
+		loops, lctx := errgroup.WithContext(gctx)
+		loops.Go(func() error { return w.Run(lctx) })
+		loops.Go(func() error { return w.RunReaper(lctx) })
+		loops.Go(func() error { return w.RunStats(lctx) })
+		loops.Go(func() error { return w.RunPurge(lctx) })
+		return loops.Wait()
 	})
-	g.Go(func() error { return w.RunReaper(gctx) })
-	g.Go(func() error { return w.RunStats(gctx) })
-	g.Go(func() error { return w.RunPurge(gctx) })
 	return g.Wait()
 }
 

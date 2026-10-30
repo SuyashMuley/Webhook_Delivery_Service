@@ -1,6 +1,28 @@
 DATABASE_URL ?= postgres://webhooks:webhooks@localhost:5432/webhooks?sslmode=disable
 export DATABASE_URL
 
+# A 3-node kind cluster running deploy/k8s (needs kind, kubectl and docker).
+kind-up:
+	kind get clusters | grep -qx webhooks || ./deploy/kind/create-cluster.sh
+	for c in api worker migrate mockreceiver; do docker build -q --build-arg CMD=$${c} -t webhook-delivery-$${c}:latest . >/dev/null; done
+	kind load docker-image --name webhooks webhook-delivery-api:latest webhook-delivery-worker:latest webhook-delivery-migrate:latest webhook-delivery-mockreceiver:latest
+	./deploy/kind/up.sh
+
+kind-down:
+	kind delete cluster --name webhooks
+
+# Prove the NetworkPolicies are enforced (not just valid), from the workloads' own network identity.
+kind-netpol:
+	./deploy/kind/netpol-check.sh
+
+# Load from inside the cluster while rolling the api and workers, crashing a worker and draining a node.
+kind-e2e:
+	kubectl --context kind-webhooks apply -k deploy/kind-e2e
+	kubectl --context kind-webhooks -n webhooks rollout restart deploy/webhook-api deploy/webhook-worker
+	kubectl --context kind-webhooks -n webhooks rollout status deploy/webhook-api --timeout=180s
+	kubectl --context kind-webhooks -n webhooks rollout status deploy/webhook-worker --timeout=180s
+	./deploy/kind-e2e/disruption-test.sh
+
 # Build the service binaries (used by the load/chaos tool, which runs them as real processes).
 bin:
 	go build -o bin/ ./cmd/api ./cmd/worker ./cmd/loadtest
@@ -17,7 +39,7 @@ bench:
 	docker compose up -d postgres --wait
 	go test ./internal/store -run xxx -bench ClaimParallel -benchtime 2000x -cpu 1,8
 
-.PHONY: bin loadtest bench up-obs test-alerts gen-k8s-rules validate-k8s build test lint vet up down migrate-up migrate-down migrate-status run-api run-worker
+.PHONY: kind-up kind-down kind-netpol kind-e2e bin loadtest bench up-obs test-alerts gen-k8s-rules validate-k8s build test lint vet up down migrate-up migrate-down migrate-status run-api run-worker
 
 build:
 	go build ./...

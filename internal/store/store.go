@@ -71,8 +71,10 @@ func Connect(ctx context.Context, databaseURL string, opts ...Option) (*Store, e
 // ConnectWithRetry is Connect, but keeps trying for up to wait if the database
 // is unreachable. Services use it at startup so that a brief outage (a failover,
 // a partition, a restart of the database) delays them instead of crashing them.
-// A configuration error (an unparseable URL) fails immediately.
-func ConnectWithRetry(ctx context.Context, databaseURL string, wait time.Duration, opts ...Option) (*Store, error) {
+// A configuration error (an unparseable URL) fails immediately. onRetry, if set,
+// is told about each failed attempt so an operator can see why it is waiting
+// (wrong password, unreachable host, ...).
+func ConnectWithRetry(ctx context.Context, databaseURL string, wait time.Duration, onRetry func(err error), opts ...Option) (*Store, error) {
 	if _, err := pgxpool.ParseConfig(databaseURL); err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
@@ -86,6 +88,9 @@ func ConnectWithRetry(ctx context.Context, databaseURL string, wait time.Duratio
 		remaining := time.Until(deadline)
 		if ctx.Err() != nil || remaining <= 0 {
 			return nil, err
+		}
+		if onRetry != nil {
+			onRetry(err)
 		}
 		select { // wait, but never past the deadline: make a last attempt right at it
 		case <-ctx.Done():

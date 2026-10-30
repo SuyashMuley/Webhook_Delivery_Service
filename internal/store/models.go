@@ -184,7 +184,13 @@ type Attempt struct {
 
 // QueueStats is a point-in-time sample of the queue, for metrics.
 type QueueStats struct {
-	Due          int // pending and due now
+	Due int // pending and due now
+	// DueClaimable is the part of Due that an additional worker could take right now:
+	// the endpoint is active with a closed circuit and a free concurrency slot, and the
+	// tenant is active and under its in-flight cap. This, not Due, is what to autoscale
+	// workers on: work held back by paused endpoints, open circuits or a slow customer's
+	// own concurrency cap cannot be sped up by adding workers.
+	DueClaimable int
 	Scheduled    int // pending, waiting for a retry time
 	InFlight     int
 	DeadByReason map[string]int

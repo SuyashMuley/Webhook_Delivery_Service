@@ -1,0 +1,81 @@
+# TEST ONLY: prometheus-adapter serving the EXTERNAL metrics API from Prometheus, using the
+# same rules operators are told to use (deploy/k8s/optional/prometheus-adapter-rules.yaml).
+# Without it the worker HorizontalPodAutoscaler cannot read the queue metrics at all.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: prometheus-adapter, namespace: monitoring }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: prometheus-adapter-auth-delegator }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "system:auth-delegator" }
+subjects: [{ kind: ServiceAccount, name: prometheus-adapter, namespace: monitoring }]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: prometheus-adapter-auth-reader, namespace: kube-system }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: extension-apiserver-authentication-reader }
+subjects: [{ kind: ServiceAccount, name: prometheus-adapter, namespace: monitoring }]
+---
+# Lets the HPA controller read the external metrics API.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: external-metrics-reader }
+rules:
+  - apiGroups: ["external.metrics.k8s.io"]
+    resources: ["*"]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: hpa-external-metrics-reader }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: external-metrics-reader }
+subjects: [{ kind: ServiceAccount, name: horizontal-pod-autoscaler, namespace: kube-system }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus-adapter, namespace: monitoring }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus-adapter }
+  template:
+    metadata:
+      labels: { app: prometheus-adapter }
+    spec:
+      serviceAccountName: prometheus-adapter
+      containers:
+        - name: adapter
+          image: registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.12.0
+          args:
+            - --secure-port=6443
+            - --cert-dir=/tmp/cert
+            - --prometheus-url=http://prometheus.monitoring.svc:9090
+            - --config=/etc/adapter/config.yaml
+            - --metrics-relist-interval=10s
+            - --v=2
+          ports: [{ name: https, containerPort: 6443 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/adapter }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: config, configMap: { name: prometheus-adapter-webhook-rules } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus-adapter, namespace: monitoring }
+spec:
+  selector: { app: prometheus-adapter }
+  ports: [{ name: https, port: 443, targetPort: https }]
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata: { name: v1beta1.external.metrics.k8s.io }
+spec:
+  group: external.metrics.k8s.io
+  version: v1beta1
+  service: { name: prometheus-adapter, namespace: monitoring }
+  insecureSkipTLSVerify: true   # test only
+  groupPriorityMinimum: 100
+  versionPriority: 100

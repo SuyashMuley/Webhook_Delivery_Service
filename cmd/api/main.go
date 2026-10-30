@@ -60,34 +60,21 @@ func run() error {
 	if cfg.DBRole != "" {
 		opts = append(opts, store.WithRole(cfg.DBRole))
 	}
-	db, err := store.ConnectWithRetry(ctx, cfg.DatabaseURL, 60*time.Second, opts...)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	db.Sealer = ring
 
 	m := metrics.New()
-	notifier := db.NewNotifier(10 * time.Millisecond)
-	go notifier.Run(ctx)
 	drain := &server.Drain{}
-	mux := server.NewMux(db, drain)
-	// Plain-http and internal endpoint URLs are convenient locally and forbidden in production.
-	api.New(db, log, api.Options{
-		AllowInsecureURLs: cfg.AllowPrivateTargets,
-		MaxAttempts:       cfg.MaxAttempts,
-		RequestTimeout:    cfg.APIRequestTimeout,
-		Quota:             ratelimit.New(db, m, log, ratelimit.Config{}),
-		Metrics:           m,
-		Wake:              notifier.Notify,
-	}).Register(mux)
+	// The HTTP server starts at once behind a Gate, before the database is reachable:
+	// liveness answers immediately (so Kubernetes does not kill a process that is merely
+	// waiting) and readiness stays red until the app is open.
+	gate := server.NewGate()
 
-	// The /metrics server is separate from the public one so the ingress never exposes it.
 	g, gctx := errgroup.WithContext(ctx)
+	serverDone := make(chan struct{})
 	g.Go(func() error {
-		return server.Run(gctx, log, cfg.HTTPAddr, server.Instrument(log, m, mux), cfg.ShutdownTimeout,
-			server.WithDrain(drain, cfg.DrainDelay))
+		defer close(serverDone)
+		return server.Run(gctx, log, cfg.HTTPAddr, gate, cfg.ShutdownTimeout, server.WithDrain(drain, cfg.DrainDelay))
 	})
+	// The /metrics server is separate from the public one so the ingress never exposes it.
 	if cfg.MetricsAddr != "" {
 		g.Go(func() error {
 			mm := http.NewServeMux()
@@ -95,5 +82,32 @@ func run() error {
 			return server.Run(gctx, log, cfg.MetricsAddr, mm, 5*time.Second)
 		})
 	}
+	g.Go(func() error {
+		db, err := store.ConnectWithRetry(gctx, cfg.DatabaseURL, 60*time.Second,
+			func(err error) { log.Warn("waiting for the database", "error", err) }, opts...)
+		if err != nil {
+			return fmt.Errorf("database: %w", err)
+		}
+		// Keep the pool until the server has finished draining its in-flight requests.
+		defer func() { <-serverDone; db.Close() }()
+		db.Sealer = ring
+
+		notifier := db.NewNotifier(10 * time.Millisecond)
+		go notifier.Run(gctx)
+		mux := server.NewMux(db, drain)
+		// Plain-http and internal endpoint URLs are convenient locally and forbidden in production.
+		api.New(db, log, api.Options{
+			AllowInsecureURLs: cfg.AllowPrivateTargets,
+			MaxAttempts:       cfg.MaxAttempts,
+			RequestTimeout:    cfg.APIRequestTimeout,
+			Quota:             ratelimit.New(db, m, log, ratelimit.Config{}),
+			Metrics:           m,
+			Wake:              notifier.Notify,
+		}).Register(mux)
+		gate.Open(server.Instrument(log, m, mux))
+		log.Info("ready")
+		<-gctx.Done()
+		return nil
+	})
 	return g.Wait()
 }

@@ -41,4 +41,4 @@ On `SIGTERM`: readiness starts failing (`SHUTDOWN_DRAIN_DELAY`, 3s) so the Servi
 - The NetworkPolicies assume namespaces named `ingress-nginx`, `monitoring`, `database` and `observability`, and a CNI that enforces NetworkPolicy. Adjust the selectors for your cluster.
 - Worker `maxReplicas` (10) bounds database connections: each worker holds a pool. Size Postgres, or put PgBouncer in front, for the maximum.
 - The worker HPA needs prometheus-adapter (or KEDA with an equivalent Prometheus trigger). Without it, remove the two External metrics and scale on CPU only, or set replicas manually.
-- This base is validated against the Kubernetes 1.30 schemas; it has not been applied to a live cluster.
+- This base is schema-validated against Kubernetes 1.30 in CI **and has been applied to a live 3-node cluster running Kubernetes 1.37 with Calico**. What that showed, and what it did not, is in [docs/kubernetes-verification.md](../../docs/kubernetes-verification.md). Try it yourself with `make kind-up`, `make kind-netpol` and `make kind-e2e` (needs `kind`, `kubectl` and Docker).

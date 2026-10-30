@@ -50,6 +50,34 @@ func NewMux(db Pinger, drain *Drain) *http.ServeMux {
 	return mux
 }
 
+// Gate is an http.Handler that is alive immediately but not ready until the app
+// behind it is: /healthz always answers 200, and everything else (including
+// /readyz) answers 503 with Retry-After until Open installs the real handler.
+//
+// It lets a service start listening before it can reach its database. Liveness
+// stays green, so Kubernetes does not kill a process that is merely waiting, while
+// readiness stays red, so no traffic is routed to it.
+type Gate struct{ h atomic.Pointer[http.Handler] }
+
+func NewGate() *Gate { return &Gate{} }
+
+// Open makes h handle all requests from now on.
+func (g *Gate) Open(h http.Handler) { g.h.Store(&h) }
+
+func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h := g.h.Load(); h != nil {
+		(*h).ServeHTTP(w, r)
+		return
+	}
+	if r.URL.Path == "/healthz" {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	w.Header().Set("Retry-After", "2")
+	http.Error(w, "starting: waiting for dependencies", http.StatusServiceUnavailable)
+}
+
 // RunOption customizes Run.
 type RunOption func(*runConfig)
 

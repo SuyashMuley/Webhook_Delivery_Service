@@ -1,0 +1,51 @@
+# TEST ONLY: a throwaway Postgres for the kind cluster (no persistence, fixed
+# password). In a real deployment the database is managed and lives outside
+# this repository.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: database
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          args: ["-c", "max_connections=300"]
+          env:
+            - { name: POSTGRES_USER, value: webhooks_owner }
+            - { name: POSTGRES_PASSWORD, value: owner-test-password }
+            - { name: POSTGRES_DB, value: webhooks }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: pg, containerPort: 5432 }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "webhooks_owner", "-d", "webhooks"] }
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: database
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: pg, port: 5432, targetPort: pg }

@@ -126,7 +126,7 @@ func TestConnectWithRetryWaitsForTheDatabase(t *testing.T) {
 	proxy.SetMode(chaosproxy.Reset) // the database is unreachable
 	go func() { time.Sleep(1200 * time.Millisecond); proxy.SetMode(chaosproxy.Pass) }()
 	start := time.Now()
-	st, err := store.ConnectWithRetry(context.Background(), u.String(), 15*time.Second)
+	st, err := store.ConnectWithRetry(context.Background(), u.String(), 15*time.Second, nil)
 	if err != nil {
 		t.Fatalf("did not wait out a short outage: %v", err)
 	}
@@ -137,14 +137,14 @@ func TestConnectWithRetryWaitsForTheDatabase(t *testing.T) {
 
 	// A bad URL is a configuration error, not an outage: fail at once instead of waiting.
 	start = time.Now()
-	if _, err := store.ConnectWithRetry(context.Background(), "postgres://%zz", 15*time.Second); err == nil || time.Since(start) > time.Second {
+	if _, err := store.ConnectWithRetry(context.Background(), "postgres://%zz", 15*time.Second, nil); err == nil || time.Since(start) > time.Second {
 		t.Fatalf("a malformed URL should fail immediately, got %v after %v", err, time.Since(start))
 	}
 
 	// And it does give up when the database never comes back.
 	proxy.SetMode(chaosproxy.Reset)
 	start = time.Now()
-	if _, err := store.ConnectWithRetry(context.Background(), u.String(), 1500*time.Millisecond); err == nil {
+	if _, err := store.ConnectWithRetry(context.Background(), u.String(), 1500*time.Millisecond, nil); err == nil {
 		t.Fatal("connected to a database that is down")
 	}
 	if took := time.Since(start); took < time.Second || took > 6*time.Second {

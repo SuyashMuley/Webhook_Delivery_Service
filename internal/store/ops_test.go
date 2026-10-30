@@ -47,6 +47,16 @@ func TestQueueStatsSeparatesLatencyFromDeliberatelyHeldWork(t *testing.T) {
 	if got.OldestDueAge < 115*time.Second || got.OldestDueAge > 140*time.Second {
 		t.Errorf("oldest due age = %v, want ~120s: work held for paused/open-circuit endpoints (5h) and work behind a slow endpoint's own concurrency cap (4h) must be excluded", got.OldestDueAge)
 	}
+	// Of the 7 due deliveries only healthy's 2 could be taken by an extra worker: paused endpoints and
+	// open circuits will not be claimed, and slowcustomer's endpoint is at its concurrency cap.
+	if got.DueClaimable != 2 {
+		t.Errorf("claimable due = %d, want 2 (work behind paused endpoints, open circuits and a saturated endpoint cannot be helped by more workers)", got.DueClaimable)
+	}
+	// Of the 7 due deliveries only healthy's 2 could be taken by an extra worker: paused endpoints and
+	// open circuits will not be claimed, and slowcustomer's endpoint is at its concurrency cap.
+	if got.DueClaimable != 2 {
+		t.Errorf("claimable due = %d, want 2 (work behind paused endpoints, open circuits and a saturated endpoint cannot be helped by more workers)", got.DueClaimable)
+	}
 	if got.Scheduled != 1 {
 		t.Errorf("scheduled = %d, want 1", got.Scheduled)
 	}

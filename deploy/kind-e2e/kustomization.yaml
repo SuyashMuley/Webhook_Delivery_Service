@@ -1,0 +1,22 @@
+# TEST ONLY. Adds an in-cluster receiver and relaxes the production restrictions that
+# would otherwise (correctly) stop the workers delivering to it: private targets are
+# allowed and the worker's egress NetworkPolicy gets an exception. Retry timings are
+# shortened so recovery after crashes is observable in seconds. Never use in production.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../kind
+  - receiver.yaml
+patches:
+  - target: { kind: ConfigMap, name: webhook-config }
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: { name: webhook-config }
+      data:
+        ALLOW_PRIVATE_TARGETS: "true"
+        RETRY_SCHEDULE: "1s,2s,3s,5s,5s,5s,5s"
+        LEASE_DURATION: "15s"
+        REAPER_INTERVAL: "3s"
+        DELIVERY_TIMEOUT: "5s"
+        PURGE_INTERVAL: "0s"

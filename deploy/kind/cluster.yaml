@@ -1,0 +1,23 @@
+# A local test cluster for deploy/k8s: one control plane and two workers in
+# different (fake) zones, so topology spread, PodDisruptionBudgets and node drains
+# are real.
+#
+# kind's default CNI (kindnet) enforces NetworkPolicy INGRESS but not EGRESS, which
+# would make the egress half of deploy/k8s/networkpolicy.yaml untestable (measured:
+# a bare deny-all-egress policy blocked nothing). So the default CNI is disabled and
+# Calico is installed instead by create-cluster.sh.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16   # Calico's default pool
+nodes:
+  - role: control-plane
+    # Lets a real ingress controller (ingress-nginx's kind provider) be reached from the host on :8088.
+    labels: { ingress-ready: "true" }
+    extraPortMappings:
+      - { containerPort: 80, hostPort: 8088, protocol: TCP }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: zone-a }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: zone-b }

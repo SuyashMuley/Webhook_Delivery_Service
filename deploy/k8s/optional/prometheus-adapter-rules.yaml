@@ -13,8 +13,13 @@ metadata:
 data:
   config.yaml: |
     externalRules:
-      - seriesQuery: 'webhook_queue_depth{state="due"}'
-        metricsQuery: 'max(webhook_queue_depth{state="due"})'
+      # due_claimable, not due: due also counts work held back by paused endpoints, open
+      # circuits and a slow customer's own concurrency cap, which more workers cannot speed up.
+      - seriesQuery: 'webhook_queue_depth{state="due_claimable"}'
+        # min over the last minute: the instantaneous value flickers up whenever a capped endpoint
+        # momentarily has a free slot (the whole backlog then counts as claimable), whereas a real
+        # worker shortage keeps claimable work continuously high.
+        metricsQuery: 'min_over_time(max(webhook_queue_depth{state="due_claimable"})[1m:10s])'
         name: { as: "webhook_queue_due_deliveries" }
         resources: { namespaced: false }
       - seriesQuery: 'webhook_oldest_pending_age_seconds'

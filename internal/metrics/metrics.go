@@ -99,7 +99,7 @@ func New() *Metrics {
 		Name: "purged_rows_total", Help: "Rows removed by the retention job."})), []string{"table"})
 
 	m.QueueDepth = prometheus.NewGaugeVec(prometheus.GaugeOpts(f(prometheus.Opts{
-		Name: "queue_depth", Help: "Deliveries by state: due (claimable now), scheduled (waiting for a retry time), in_flight."})), []string{"state"})
+		Name: "queue_depth", Help: "Deliveries by state: due (all due work), due_claimable (due work extra workers could take now: the autoscaling signal), scheduled (waiting for a retry time), in_flight."})), []string{"state"})
 	m.OldestPendingAge = prometheus.NewGauge(prometheus.GaugeOpts(f(prometheus.Opts{
 		Name: "oldest_pending_age_seconds",
 		Help: "Age of the oldest due delivery whose endpoint is claimable. The primary latency SLO signal; excludes work held for paused endpoints and open circuits."})))

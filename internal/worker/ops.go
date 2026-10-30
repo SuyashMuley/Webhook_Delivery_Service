@@ -33,6 +33,7 @@ func (w *Worker) sampleStats(ctx context.Context) {
 		return
 	}
 	w.m.QueueDepth.WithLabelValues("due").Set(float64(st.Due))
+	w.m.QueueDepth.WithLabelValues("due_claimable").Set(float64(st.DueClaimable))
 	w.m.QueueDepth.WithLabelValues("scheduled").Set(float64(st.Scheduled))
 	w.m.QueueDepth.WithLabelValues("in_flight").Set(float64(st.InFlight))
 	w.m.OldestPendingAge.Set(st.OldestDueAge.Seconds())

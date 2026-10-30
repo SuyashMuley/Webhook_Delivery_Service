@@ -129,3 +129,45 @@ func TestInstrumentRecordsMetricsLogsAndRequestID(t *testing.T) {
 		t.Errorf("request id = %q, want the caller's", rec.Header().Get("X-Request-Id"))
 	}
 }
+
+// A service that is still connecting to its database must be alive but not ready:
+// Kubernetes kills a container whose liveness/startup probe fails, which would turn
+// "the database is a few seconds late" into a crash loop.
+func TestGateIsAliveButNotReadyUntilOpened(t *testing.T) {
+	g := NewGate()
+	call := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+		return rec
+	}
+
+	if got := call("/healthz").Code; got != http.StatusOK {
+		t.Fatalf("liveness before the app is ready = %d, want 200", got)
+	}
+	if got := call("/readyz").Code; got != http.StatusServiceUnavailable {
+		t.Fatalf("readiness before the app is ready = %d, want 503", got)
+	}
+	rec := call("/v1/events")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("a real request before ready = %d (Retry-After %q), want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+
+	var seen []string
+	g.Open(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Path)
+		_, _ = w.Write([]byte("app"))
+	}))
+	if rec := call("/v1/events"); rec.Code != http.StatusOK || rec.Body.String() != "app" {
+		t.Fatalf("after Open the request did not reach the app: %d %q", rec.Code, rec.Body.String())
+	}
+	// Readiness must be answered by the app (it knows about the database and draining).
+	if rec := call("/readyz"); rec.Body.String() != "app" {
+		t.Fatalf("after Open /readyz was not handled by the app, got %q", rec.Body.String())
+	}
+	if len(seen) != 2 || seen[0] != "/v1/events" || seen[1] != "/readyz" {
+		t.Fatalf("the app saw %v", seen)
+	}
+	if got := call("/healthz").Code; got != http.StatusOK {
+		t.Fatalf("liveness after open = %d", got)
+	}
+}
