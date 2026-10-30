@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"webhookdelivery/internal/invariants"
+	"webhookdelivery/internal/harness/invariants"
 )
 
 // Latencies are measured by the receiver's own clock, independent of the

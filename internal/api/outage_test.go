@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"webhookdelivery/internal/api"
-	"webhookdelivery/internal/chaosproxy"
+	"webhookdelivery/internal/harness/chaosproxy"
 	"webhookdelivery/internal/store"
 	tu "webhookdelivery/internal/testutil"
 )

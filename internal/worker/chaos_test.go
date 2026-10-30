@@ -10,7 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"webhookdelivery/internal/invariants"
+	"webhookdelivery/internal/harness/invariants"
 	"webhookdelivery/internal/store"
 	tu "webhookdelivery/internal/testutil"
 )

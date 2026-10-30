@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"webhookdelivery/internal/chaosproxy"
+	"webhookdelivery/internal/harness/chaosproxy"
 )
 
 // Env is everything a fault can act on.

@@ -22,7 +22,7 @@ What was measured, how, what it showed, the bugs it found, and what it does **no
 
 Latency is measured two independent ways: by the receiver's clock (from when the producer sent the request to the first time the endpoint acknowledged the event) and by the workers' `webhook_first_attempt_delay_seconds` histogram. They agree.
 
-### The invariants (`internal/invariants`)
+### The invariants (`internal/harness/invariants`)
 
 For the set of events the producer was told were accepted:
 

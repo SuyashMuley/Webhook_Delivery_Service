@@ -117,11 +117,12 @@ internal/store             Postgres queries (events, endpoints, queue, stats, re
 internal/metrics           Prometheus metric definitions
 internal/telemetry         OpenTelemetry setup and trace-context propagation
 internal/ratelimit         per-tenant ingest quotas
-internal/invariants        database invariant checker (used by tests and the load tool)
-internal/loadtest          load generator, fault-injecting receiver, scenarios
-internal/chaosproxy        TCP proxy that simulates network partitions
-cmd/loadtest               load and chaos test driver
 internal/testutil          per-test Postgres databases
+internal/harness/          verification tooling, kept apart from the service code
+  invariants               database invariant checker (used by tests and the load tool)
+  loadtest                 load generator, fault-injecting receiver, soak sampler, scenarios
+  chaosproxy               TCP proxy that simulates network partitions
+cmd/loadtest               load and chaos test driver
 migrations/                goose SQL migrations (embedded)
 deploy/                    prometheus rules, grafana dashboard, kubernetes manifests
 docs/                      architecture.md, plan.md

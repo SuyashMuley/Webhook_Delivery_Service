@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"webhookdelivery/internal/chaosproxy"
+	"webhookdelivery/internal/harness/chaosproxy"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/internal/testutil"
 )

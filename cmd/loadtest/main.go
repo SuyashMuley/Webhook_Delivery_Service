@@ -4,7 +4,7 @@
 // It creates a throwaway database, starts real api and worker processes (so
 // `kill -9` is a genuine process crash), runs an embedded receiver that can
 // misbehave, sends events at a fixed rate, and finally checks the database
-// invariants (see internal/invariants).
+// invariants (see internal/harness/invariants).
 //
 //	make bin
 //	go run ./cmd/loadtest -scenario none -rate 400 -fanout 5 -duration 60s
@@ -35,9 +35,9 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
-	"webhookdelivery/internal/chaosproxy"
-	"webhookdelivery/internal/invariants"
-	"webhookdelivery/internal/loadtest"
+	"webhookdelivery/internal/harness/chaosproxy"
+	"webhookdelivery/internal/harness/invariants"
+	"webhookdelivery/internal/harness/loadtest"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/migrations"
 )

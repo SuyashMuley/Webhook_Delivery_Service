@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"webhookdelivery/internal/invariants"
+	"webhookdelivery/internal/harness/invariants"
 	"webhookdelivery/internal/store"
 	"webhookdelivery/internal/testutil"
 )

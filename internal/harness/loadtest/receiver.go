@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"webhookdelivery/internal/invariants"
+	"webhookdelivery/internal/harness/invariants"
 	"webhookdelivery/internal/sign"
 )
 
